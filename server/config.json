@@ -1,0 +1,12 @@
+{
+  "city": "Eindhoven",
+  "weather_lat": 51.4416,
+  "weather_lon": 5.4697,
+  "origin_lat": null,
+  "origin_lon": null,
+  "ericsson_breda_lat": null,
+  "ericsson_breda_lon": null,
+  "ericsson_maastricht_lat": null,
+  "ericsson_maastricht_lon": null,
+  "notes": "Routetijden vereisen vertrekpunt, exacte kantoorcoordinaten en TOMTOM_API_KEY in je Mac-omgeving. Geen adressen vereist voor de demo."
+}
