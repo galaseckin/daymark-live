@@ -34,7 +34,7 @@ jobs:
         run: pip install --disable-pip-version-check -r server/requirements.txt
       - name: Generate REAL data image
         env:
-          TOMTOM_API_KEY: ${{ secrets.TOMTOM_API_KEY }}
+          GOOGLE_MAPS_API_KEY: ${{ secrets.GOOGLE_MAPS_API_KEY }}
           DAYMARK_ORIGIN_LAT: ${{ secrets.DAYMARK_ORIGIN_LAT }}
           DAYMARK_ORIGIN_LON: ${{ secrets.DAYMARK_ORIGIN_LON }}
           DAYMARK_BREDA_LAT: ${{ secrets.DAYMARK_BREDA_LAT }}
