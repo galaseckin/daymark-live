@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DAYMARK v3.6 • live-rendered Kindle Paperwhite 2 landscape dashboard.
+"""DAYMARK v3.7 • live-rendered Kindle Paperwhite 2 landscape dashboard.
 
 Generates both a 1024x758 design preview and a physically rotated
 758x1024 framebuffer image (so a portrait-orientation Kindle can be
@@ -285,6 +285,66 @@ def football(now):
             'feed_errors':source_errors[:3]}
 
 
+def weekend_football(now):
+    """Live ESPN fixtures for weekend; never invent matches or results."""
+    if now.weekday() not in (5,6):
+        return {'matches':[], 'sources_ok':0, 'errors':[]}
+    saturday=(now-dt.timedelta(days=(now.weekday()-5))).replace(hour=0,minute=0,second=0,microsecond=0)
+    monday=saturday+dt.timedelta(days=2)
+    leagues=[('tur.1','SÜPER LIG'),('eng.1','PREMIER LEAGUE'),
+             ('ger.1','BUNDESLIGA'),('esp.1','LA LIGA')]
+    matches=[]; errors=[]; ok=0
+    for league,league_name in leagues:
+        month=saturday.strftime('%Y%m')
+        params=urllib.parse.urlencode({'dates':month,'limit':500})
+        payload=None
+        for host in ('site.web.api.espn.com','site.api.espn.com'):
+            try:
+                payload=get_json(f'https://{host}/apis/site/v2/sports/soccer/{league}/scoreboard?{params}',timeout=8)
+                ok+=1
+                break
+            except Exception as exc:
+                errors.append(f'{league}/{host}: {type(exc).__name__}')
+        if not payload:continue
+        for ev in payload.get('events',[]) or []:
+            when=local_date(ev.get('date'))
+            if not when or not saturday<=when<monday:continue
+            comp=(ev.get('competitions') or [{}])[0]
+            sides=comp.get('competitors') or []
+            if len(sides)!=2:continue
+            home=next((v for v in sides if v.get('homeAway')=='home'),sides[0])
+            away=next((v for v in sides if v.get('homeAway')=='away'),sides[1])
+            h=home.get('team') or {}; a=away.get('team') or {}
+            hn=str(h.get('displayName') or h.get('name') or '')
+            an=str(a.get('displayName') or a.get('name') or '')
+            if not hn or not an:continue
+            # Galatasaray already has a dedicated panel.
+            if 'galatasaray' in (hn+' '+an).casefold():continue
+            status=(ev.get('status') or {}).get('type') or {}
+            state=status.get('state','pre')
+            def score(side):
+                val=side.get('score')
+                if isinstance(val,dict):val=val.get('displayValue',val.get('value'))
+                return str(val) if val is not None else '?'
+            fener='fenerbah' in (hn+' '+an).casefold()
+            # Preserve ESPN source names; use verified three-star textual mark, no fabricated logo.
+            matches.append({'home':hn,'away':an,'date':when,'league':league_name,
+                            'fener':fener,'state':state,
+                            'score':f'{score(home)}-{score(away)}' if state in ('in','post') else None,
+                            'id':str(ev.get('id') or '')})
+    # Priority to Fenerbahçe, then marquee clubs. Keep chronological order within priority.
+    big=('liverpool','arsenal','manchester','chelsea','tottenham','bayern',
+         'dortmund','barcelona','real madrid','atlético','atletico','newcastle')
+    def priority(m):
+        names=(m['home']+' '+m['away']).casefold()
+        marquee=sum(v in names for v in big)
+        return (0 if m['fener'] else 1, -marquee, m['date'])
+    matches.sort(key=priority)
+    picked=matches[:5]
+    # Order selected games by kickoff, keeping Fener's guaranteed slot.
+    picked.sort(key=lambda m:m['date'])
+    return {'matches':picked,'sources_ok':ok,'errors':errors}
+
 def stock(symbol):
     url='https://query1.finance.yahoo.com/v8/finance/chart/'+urllib.parse.quote(symbol,safe='')+'?range=1mo&interval=1d'
     raw=get_json(url)
@@ -390,6 +450,7 @@ def demo_data():
                       'PLTR':{'price':153.60,'change':-0.4,'points':[4,5,6,5,5,4,7,6,5]},
                       'AAPL':{'price':284.13,'change':0.8,'points':[2,4,3,5,7,6,8,8,9]}},
             'gold':{'price':128300.0,'change':0.3},
+            'weekend':{'matches':[],'sources_ok':0,'errors':[]},
             'routes':{'breda':43,'utrecht':72,'maastricht':66},
             'errors':[]}
 
@@ -406,6 +467,7 @@ def live_data(cfg):
             'football':attempt('voetbal',lambda:football(now),{}),
             'stocks':{name:attempt(name,lambda n=name:stock(n),{}) for name in ('NVDA','PLTR','AAPL')},
             'gold':attempt('goud',gold,{}),
+            'weekend':attempt('weekend_football',lambda:weekend_football(now),{'matches':[]}),
             'routes':{name:attempt(name,lambda n=name:commute(cfg,n,now),None) for name in ('breda','utrecht','maastricht')},
             'errors':errors}
 
@@ -615,25 +677,52 @@ def render(data,cfg):
         draw_crest(im,d,377,395,73,90,gs_logo,'GALATASARAY')
         t(475,435,'Nog geen fixture',16,'bold')
         t(475,455,'Bron niet beschikbaar',12,'regular',GRAY)
-    # MARKETS
-    x=704
-    label(x,133,'MARKTEN  /  USD')
-    tx=704
-    for i,(ticker,name) in enumerate([('NVDA','NVIDIA'),('PLTR','PALANTIR'),('AAPL','APPLE')]):
-        yy=171+i*80
-        if i>0:rule(704,yy-9,973,yy-9)
-        quote=stocks.get(ticker,{})
-        t(tx,yy,ticker,24,'heavy')
-        t(tx,yy+31,name,13,'bold',GRAY)
-        p=quote.get('price');delta=quote.get('change')
-        t(972,yy+2,f'${p:,.2f}' if isinstance(p,(int,float)) else '—',21,'bold',INK,anchor='ra')
-        t(847,yy+33,signed(delta),15,'bold',GRAY,anchor='ra')
-        spark(quote.get('points') or [],868,yy+34,105,25)
-    rule(704,403,973,403,INK,2)
-    label(704,419,'GOUD  /  EUR PER KG')
-    t(704,450,euro(gd.get('price')),32,'heavy')
-    t(704,497,signed(gd.get('change'))+'  ·  SPOT',15,'bold',GRAY)
-    t(704,537,'Gold price data by Corgano',11,'regular',GRAY)
+    # WEEKEND: replace market panel with five real football fixtures.
+    # Weekdays retain the existing market layout unchanged.
+    if now.weekday() in (5,6):
+        label(704,133,'FOOTBALL WEEKEND  /  5 MATCHES')
+        games=(data.get('weekend') or {}).get('matches') or []
+        if not games:
+            t(704,194,'Geen bevestigde',20,'bold')
+            t(704,224,'wedstrijden beschikbaar',17,'regular',GRAY)
+            t(704,267,'ESPN-data tijdelijk',14,'regular',GRAY)
+            t(704,290,'niet beschikbaar',14,'regular',GRAY)
+        for i,game in enumerate(games[:5]):
+            yy=171+i*77
+            if i:rule(704,yy-12,973,yy-12)
+            names=game['home']+' - '+game['away']
+            # Never render a potentially incorrect Fenerbahçe crest:
+            # show a three-star label instead, until a verified asset is supplied.
+            if game.get('fener'):
+                t(704,yy-5,'FENERBAHÇE  ★★★',11,'bold',GRAY)
+                t(704,yy+12,fit(names,15,268,'bold'),15,'bold')
+            else:
+                t(704,yy,fit(names,17,268,'bold'),17,'bold')
+            stamp=game['date'].strftime('%a %H:%M').upper()
+            result=game.get('score')
+            t(704,yy+35,game['league'],11,'regular',GRAY)
+            t(973,yy+34,result if result else stamp,13,'bold',INK,anchor='ra')
+        t(704,541,'ESPN  ·  tijden NL  ·  live indien beschikbaar',10,'regular',GRAY)
+    else:
+        # MARKETS
+        x=704
+        label(x,133,'MARKTEN  /  USD')
+        tx=704
+        for i,(ticker,name) in enumerate([('NVDA','NVIDIA'),('PLTR','PALANTIR'),('AAPL','APPLE')]):
+            yy=171+i*80
+            if i>0:rule(704,yy-9,973,yy-9)
+            quote=stocks.get(ticker,{})
+            t(tx,yy,ticker,24,'heavy')
+            t(tx,yy+31,name,13,'bold',GRAY)
+            p=quote.get('price');delta=quote.get('change')
+            t(972,yy+2,f'${p:,.2f}' if isinstance(p,(int,float)) else '—',21,'bold',INK,anchor='ra')
+            t(847,yy+33,signed(delta),15,'bold',GRAY,anchor='ra')
+            spark(quote.get('points') or [],868,yy+34,105,25)
+        rule(704,403,973,403,INK,2)
+        label(704,419,'GOUD  /  EUR PER KG')
+        t(704,450,euro(gd.get('price')),32,'heavy')
+        t(704,497,signed(gd.get('change'))+'  ·  SPOT',15,'bold',GRAY)
+        t(704,537,'Gold price data by Corgano',11,'regular',GRAY)
     # COMMUTE LOWER BAR: departure Meerhoven, Utrecht University as center column
     panel(33,587,991,703)
     label(52,598,'ROUTES  /  '+('NAAR MEERHOVEN' if route_period(now)=='terug' else 'VANAF MEERHOVEN')+'  ·  Google Maps')
@@ -725,7 +814,10 @@ def main():
                 'football_next_opponent':(data.get('football',{}).get('next') or {}).get('opponent'),
                 'football_next_kickoff_nl':(data.get('football',{}).get('next') or {}).get('date').isoformat() if (data.get('football',{}).get('next') or {}).get('date') else None,
                 'football_feed_sources_ok':data.get('football',{}).get('sources_ok',0),
-                'football_feed_errors':data.get('football',{}).get('feed_errors',[])}
+                'football_feed_errors':data.get('football',{}).get('feed_errors',[]),
+                'weekend_matches':len((data.get('weekend') or {}).get('matches') or []),
+                'weekend_sources_ok':(data.get('weekend') or {}).get('sources_ok',0),
+                'weekend_errors':(data.get('weekend') or {}).get('errors',[])}
         (dest/'status.json').write_text(json.dumps(status,indent=2,ensure_ascii=False)+'\n',encoding='utf-8')
         print('Web feed:',dest/'daymark.png')
     if args.install:install(args.kindle,preview,right,left)
