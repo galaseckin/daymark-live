@@ -1,0 +1,53 @@
+
+name: Render & publish DAYMARK v3
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Dependencies
+        run: pip install --disable-pip-version-check -r server/requirements.txt
+      - name: Generate REAL data image
+        env:
+          TOMTOM_API_KEY: ${{ secrets.TOMTOM_API_KEY }}
+          DAYMARK_ORIGIN_LAT: ${{ secrets.DAYMARK_ORIGIN_LAT }}
+          DAYMARK_ORIGIN_LON: ${{ secrets.DAYMARK_ORIGIN_LON }}
+          DAYMARK_BREDA_LAT: ${{ secrets.DAYMARK_BREDA_LAT }}
+          DAYMARK_BREDA_LON: ${{ secrets.DAYMARK_BREDA_LON }}
+          DAYMARK_MAASTRICHT_LAT: ${{ secrets.DAYMARK_MAASTRICHT_LAT }}
+          DAYMARK_MAASTRICHT_LON: ${{ secrets.DAYMARK_MAASTRICHT_LON }}
+        run: python server/daymark.py --output-dir site
+      - name: Setup GitHub Pages
+        uses: actions/configure-pages@v5
+      - name: Upload site
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - name: Publish site
+        id: deployment
+        uses: actions/deploy-pages@v4
