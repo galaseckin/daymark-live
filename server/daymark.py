@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DAYMARK v3.7 • live-rendered Kindle Paperwhite 2 landscape dashboard.
+"""DAYMARK v3.8 • live-rendered Kindle Paperwhite 2 landscape dashboard.
 
 Generates both a 1024x758 design preview and a physically rotated
 758x1024 framebuffer image (so a portrait-orientation Kindle can be
@@ -332,18 +332,62 @@ def weekend_football(now):
                             'fener':fener,'state':state,
                             'score':f'{score(home)}-{score(away)}' if state in ('in','post') else None,
                             'id':str(ev.get('id') or '')})
-    # Priority to Fenerbahçe, then marquee clubs. Keep chronological order within priority.
+    # Rank marquee matches; no automatic preference for Fenerbahçe.
     big=('liverpool','arsenal','manchester','chelsea','tottenham','bayern',
          'dortmund','barcelona','real madrid','atlético','atletico','newcastle')
     def priority(m):
         names=(m['home']+' '+m['away']).casefold()
         marquee=sum(v in names for v in big)
-        return (0 if m['fener'] else 1, -marquee, m['date'])
+        return (-marquee, m['date'])
     matches.sort(key=priority)
     picked=matches[:5]
-    # Order selected games by kickoff, keeping Fener's guaranteed slot.
+    # Display selected games chronologically.
     picked.sort(key=lambda m:m['date'])
     return {'matches':picked,'sources_ok':ok,'errors':errors}
+
+def superlig_top5():
+    """Current Turkish Super Lig standings from ESPN; empty on failed fetch."""
+    errors=[]
+    for host in ('site.web.api.espn.com','site.api.espn.com'):
+        for path in ('standings','standings?season='+str(dt.datetime.now(TZ).year)):
+            try:
+                payload=get_json(f'https://{host}/apis/v2/sports/soccer/tur.1/{path}',timeout=8)
+                # ESPN v2 standings response commonly: children[].standings.entries
+                groups=payload.get('children') or []
+                entries=[]
+                for group in groups:
+                    entries.extend((group.get('standings') or {}).get('entries') or [])
+                if not entries:
+                    entries=(payload.get('standings') or {}).get('entries') or []
+                rows=[]
+                for entry in entries:
+                    team=entry.get('team') or {}
+                    name=team.get('shortDisplayName') or team.get('displayName') or team.get('name')
+                    stats=entry.get('stats') or []
+                    pts=next((v.get('value') for v in stats if v.get('name') in ('points','point')),None)
+                    rank=next((v.get('value') for v in stats if v.get('name') in ('rank','ranking')),None)
+                    if name and pts is not None:
+                        rows.append({'name':str(name),'points':int(float(pts)),
+                                     'rank':int(float(rank)) if rank is not None else None})
+                if rows:
+                    if all(r['rank'] is not None for r in rows):
+                        rows.sort(key=lambda r:r['rank'])
+                    else:
+                        rows.sort(key=lambda r:r['points'],reverse=True)
+                    return {'teams':rows[:5],'available':True,'error':None}
+                errors.append('Geen ranglijstregels')
+            except Exception as exc:
+                errors.append(type(exc).__name__+': '+str(exc)[:75])
+    return {'teams':[],'available':False,'error':'; '.join(errors[-2:])}
+
+
+def birthday_notice(now):
+    """Filiz: 12 November; show 7-day countdown on weekdays, always on weekends."""
+    birthday=dt.date(now.year,11,12)
+    if now.date()>birthday:birthday=dt.date(now.year+1,11,12)
+    days=(birthday-now.date()).days
+    return {'name':'Filiz','date':birthday,'days':days,'show':now.weekday()>=5 or days<=7}
+
 
 def stock(symbol):
     url='https://query1.finance.yahoo.com/v8/finance/chart/'+urllib.parse.quote(symbol,safe='')+'?range=1mo&interval=1d'
@@ -451,6 +495,7 @@ def demo_data():
                       'AAPL':{'price':284.13,'change':0.8,'points':[2,4,3,5,7,6,8,8,9]}},
             'gold':{'price':128300.0,'change':0.3},
             'weekend':{'matches':[],'sources_ok':0,'errors':[]},
+            'standings':{'teams':[],'available':False},
             'routes':{'breda':43,'utrecht':72,'maastricht':66},
             'errors':[]}
 
@@ -468,6 +513,7 @@ def live_data(cfg):
             'stocks':{name:attempt(name,lambda n=name:stock(n),{}) for name in ('NVDA','PLTR','AAPL')},
             'gold':attempt('goud',gold,{}),
             'weekend':attempt('weekend_football',lambda:weekend_football(now),{'matches':[]}),
+            'standings':attempt('superlig_top5',superlig_top5,{'teams':[],'available':False}) if now.weekday()>=5 else {'teams':[],'available':False},
             'routes':{name:attempt(name,lambda n=name:commute(cfg,n,now),None) for name in ('breda','utrecht','maastricht')},
             'errors':errors}
 
@@ -691,13 +737,7 @@ def render(data,cfg):
             yy=171+i*77
             if i:rule(704,yy-12,973,yy-12)
             names=game['home']+' - '+game['away']
-            # Never render a potentially incorrect Fenerbahçe crest:
-            # show a three-star label instead, until a verified asset is supplied.
-            if game.get('fener'):
-                t(704,yy-5,'FENERBAHÇE  ★★★',11,'bold',GRAY)
-                t(704,yy+12,fit(names,15,268,'bold'),15,'bold')
-            else:
-                t(704,yy,fit(names,17,268,'bold'),17,'bold')
+            t(704,yy,fit(names,17,268,'bold'),17,'bold')
             stamp=game['date'].strftime('%a %H:%M').upper()
             result=game.get('score')
             t(704,yy+35,game['league'],11,'regular',GRAY)
@@ -723,22 +763,61 @@ def render(data,cfg):
         t(704,450,euro(gd.get('price')),32,'heavy')
         t(704,497,signed(gd.get('change'))+'  ·  SPOT',15,'bold',GRAY)
         t(704,537,'Gold price data by Corgano',11,'regular',GRAY)
-    # COMMUTE LOWER BAR: departure Meerhoven, Utrecht University as center column
+    # WEEKEND LOWER BAR: birthday / real league standings / weekend weather.
     panel(33,587,991,703)
-    label(52,598,'ROUTES  /  '+('NAAR MEERHOVEN' if route_period(now)=='terug' else 'VANAF MEERHOVEN')+'  ·  Google Maps')
-    for sep in (356,668):rule(sep,633,sep,688)
-    for i,(name,title) in enumerate([('breda','BREDA'),('utrecht','UTRECHT · UU'),('maastricht','MAASTRICHT')]):
-        left=(52,373,684)[i]
-        right=(337,649,974)[i]
-        t(left,638,title,18 if i!=1 else 17,'bold',GRAY)
-        minutes=routes.get(name)
-        t(right,630,f'{minutes} MIN' if minutes is not None else '— MIN',30,'heavy',INK,anchor='ra')
-        sub='AUTO + VERKEER' if minutes is not None else 'NOG NIET INGESTELD'
-        if name=='utrecht':sub='UU SCIENCE PARK' if minutes is not None else 'UU SCIENCE PARK'
-        t(left,676,sub,12,'bold',GRAY)
+    if now.weekday() in (5,6):
+        label(52,598,'WEEKEND  /  VERJAARDAG · SÜPER LIG · WEER')
+        for sep in (356,668):rule(sep,633,sep,688)
+        birthday=birthday_notice(now)
+        t(52,637,'FILIZ  ·  12 NOVEMBER',17,'bold')
+        t(52,669,'VANDAAG!' if birthday['days']==0 else f"OVER {birthday['days']} DAGEN",18,'heavy')
+        teams=(data.get('standings') or {}).get('teams') or []
+        if teams:
+            # Five compact rows in the available 68px: no fake rank or points.
+            for i,team in enumerate(teams[:5]):
+                yy=628+i*14
+                name=fit(team['name'],11,175,'bold')
+                t(374,yy,f"{i+1}. {name}",11,'bold' if 'galatasaray' in team['name'].casefold() else 'regular')
+                t(649,yy,str(team['points'])+' PT',11,'bold',INK,anchor='ra')
+        else:
+            t(374,650,'Stand niet beschikbaar',14,'bold',GRAY)
+        # Forecast includes today and next 3 days, enough for Saturday+Sunday.
+        forecasts=we.get('forecast') or []
+        today=now.date()
+        weather_days=[]
+        for date in (today,today+dt.timedelta(days=1)):
+            if date.weekday() not in (5,6):continue
+            if date==today:
+                weather_days.append((date,we.get('high'),we.get('low'),we.get('rain')))
+            else:
+                day=next((item for item in forecasts if item.get('date')==date),{})
+                weather_days.append((date,day.get('high'),day.get('low'),day.get('rain')))
+        for i,(date,high,low,rain) in enumerate(weather_days):
+            yy=636+i*29
+            t(685,yy,f"{DAYS[date.weekday()][:2].upper()}  {num(high)}°/{num(low)}°",17,'bold')
+            t(974,yy+2,f"{num(rain)}% REGEN",12,'bold',GRAY,anchor='ra')
+    else:
+        # COMMUTE LOWER BAR: departure Meerhoven, Utrecht University as center column
+        panel(33,587,991,703)
+        label(52,598,'ROUTES  /  '+('NAAR MEERHOVEN' if route_period(now)=='terug' else 'VANAF MEERHOVEN')+'  ·  Google Maps')
+        for sep in (356,668):rule(sep,633,sep,688)
+        for i,(name,title) in enumerate([('breda','BREDA'),('utrecht','UTRECHT · UU'),('maastricht','MAASTRICHT')]):
+            left=(52,373,684)[i]
+            right=(337,649,974)[i]
+            t(left,638,title,18 if i!=1 else 17,'bold',GRAY)
+            minutes=routes.get(name)
+            t(right,630,f'{minutes} MIN' if minutes is not None else '— MIN',30,'heavy',INK,anchor='ra')
+            sub='AUTO + VERKEER' if minutes is not None else 'NOG NIET INGESTELD'
+            if name=='utrecht':sub='UU SCIENCE PARK' if minutes is not None else 'UU SCIENCE PARK'
+            t(left,676,sub,12,'bold',GRAY)
+        # Birthday notice is added only during the 7-day countdown.
+        birthday=birthday_notice(now)
+        if birthday['show']:
+            # Small header text; preserve all three existing route metrics.
+            t(974,600,'FILIZ 12 NOV · '+('VANDAAG' if birthday['days']==0 else f"OVER {birthday['days']} DAGEN"),11,'bold',INK,anchor='ra')
     # footer
     rule(33,718,991,718,INK,2)
-    t(34,730,'DAYMARK V3.6  •  PAPERWHITE 2  •  LANDSCAPE',12,'bold',GRAY)
+    t(34,730,'DAYMARK V3.8  •  PAPERWHITE 2  •  LANDSCAPE',12,'bold',GRAY)
     foot='DEMO • NIET LIVE' if data['demo'] else 'DATA KAN VERTRAAGD ZIJN • ONTBREKEND = —'
     t(991,731,foot,12,'bold',GRAY,anchor='ra')
     return im
@@ -788,7 +867,8 @@ def main():
         dest=pathlib.Path(args.output_dir)
         dest.mkdir(parents=True,exist_ok=True)
         shutil.copy2(right,dest/'daymark.png')
-        shutil.copy2(BASE/'ATTRIBUTION.md',dest/'ATTRIBUTION.md')
+        if (BASE/'ATTRIBUTION.md').exists():
+            shutil.copy2(BASE/'ATTRIBUTION.md',dest/'ATTRIBUTION.md')
         status={'generated_at':dt.datetime.now(dt.timezone.utc).isoformat(),
                 'mode':'demo' if args.demo else 'live',
                 'sources_missing':data.get('errors',[]),
@@ -817,7 +897,10 @@ def main():
                 'football_feed_errors':data.get('football',{}).get('feed_errors',[]),
                 'weekend_matches':len((data.get('weekend') or {}).get('matches') or []),
                 'weekend_sources_ok':(data.get('weekend') or {}).get('sources_ok',0),
-                'weekend_errors':(data.get('weekend') or {}).get('errors',[])}
+                'weekend_errors':(data.get('weekend') or {}).get('errors',[]),
+                'standings_available':(data.get('standings') or {}).get('available',False),
+                'standings_error':(data.get('standings') or {}).get('error'),
+                'birthday_days':birthday_notice(data['now'])['days']}
         (dest/'status.json').write_text(json.dumps(status,indent=2,ensure_ascii=False)+'\n',encoding='utf-8')
         print('Web feed:',dest/'daymark.png')
     if args.install:install(args.kindle,preview,right,left)
