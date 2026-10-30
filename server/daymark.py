@@ -139,17 +139,20 @@ def football(now):
             except Exception as ex:
                 source_errors.append(f'{league} team {query}: {ex}')
 
-        # Date-scoped scoreboards, not one large range. The API may silently
-        # truncate long date ranges. Check weekly windows from -7 to +27 days.
-        for offset in range(-7, 28, 7):
-            begin = (now + dt.timedelta(days=offset)).strftime('%Y%m%d')
-            finish = (now + dt.timedelta(days=offset+6)).strftime('%Y%m%d')
-            params = urllib.parse.urlencode({'dates': begin+'-'+finish, 'limit': 500})
+        # ESPN removed the YYYYMMDD-YYYYMMDD range form in September 2026:
+        # it now returns HTTP 400. Month queries YYYYMM are still supported.
+        # Look across the previous, current, and next two calendar months;
+        # raise the 100-event default cap with limit=500. No date ranges.
+        month_number = now.year * 12 + (now.month - 1)
+        for month_offset in (-1, 0, 1, 2):
+            index = month_number + month_offset
+            month = f'{index // 12:04d}{index % 12 + 1:02d}'
+            params = urllib.parse.urlencode({'dates': month, 'limit': 500})
             try:
-                collect(fetch('scoreboard?'+params), league, league_name)
+                collect(fetch('scoreboard?' + params), league, league_name)
                 successful_sources += 1
             except Exception as ex:
-                source_errors.append(f'{league} scoreboard {begin}: {ex}')
+                source_errors.append(f'{league} scoreboard {month}: {ex}')
 
     def is_gal(side):
         team = (side.get('team') or {}) if isinstance(side,dict) else {}
