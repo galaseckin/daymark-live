@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DAYMARK v3 • live-rendered Kindle Paperwhite 2 landscape dashboard.
+"""DAYMARK v3.6 • live-rendered Kindle Paperwhite 2 landscape dashboard.
 
 Generates both a 1024x758 design preview and a physically rotated
 758x1024 framebuffer image (so a portrait-orientation Kindle can be
@@ -36,13 +36,16 @@ DEFAULT_CONFIG={
     "city":"Eindhoven",
     "weather_lat":51.4416,
     "weather_lon":5.4697,
-    "origin_lat":None,
-    "origin_lon":None,
-    "ericsson_breda_lat":None,
-    "ericsson_breda_lon":None,
-    "ericsson_maastricht_lat":None,
-    "ericsson_maastricht_lon":None,
-    "notes":"Routetijden vereisen vertrekpunt, exacte kantoorcoordinaten en TOMTOM_API_KEY in je Mac-omgeving. Geen adressen vereist voor de demo."
+    "origin_lat":51.44148,
+    "origin_lon":5.40563,
+    "origin_area":"Meerhoven (Meerrijk)",
+    "utrecht_lat":52.0854,
+    "utrecht_lon":5.17556,
+    "breda_lat":51.5888,
+    "breda_lon":4.7769,
+    "maastricht_lat":50.8514,
+    "maastricht_lon":5.6910,
+    "notes":"Google Maps Routes API met GOOGLE_MAPS_API_KEY als GitHub Secret. Breda en Maastricht staan standaard op openbare stadscentra; UU op Heidelberglaan 8. Geen kantooradressen of thuisadres openbaar maken."
 }
 
 
@@ -52,8 +55,18 @@ def get_config():
         p.write_text(json.dumps(DEFAULT_CONFIG,indent=2,ensure_ascii=False)+'\n',encoding='utf-8')
     config={**DEFAULT_CONFIG, **json.loads(p.read_text(encoding='utf-8'))}
     env_keys={'origin_lat':'DAYMARK_ORIGIN_LAT', 'origin_lon':'DAYMARK_ORIGIN_LON',
-              'ericsson_breda_lat':'DAYMARK_BREDA_LAT', 'ericsson_breda_lon':'DAYMARK_BREDA_LON',
-              'ericsson_maastricht_lat':'DAYMARK_MAASTRICHT_LAT', 'ericsson_maastricht_lon':'DAYMARK_MAASTRICHT_LON'}
+              'breda_lat':'DAYMARK_BREDA_LAT', 'breda_lon':'DAYMARK_BREDA_LON',
+              'maastricht_lat':'DAYMARK_MAASTRICHT_LAT', 'maastricht_lon':'DAYMARK_MAASTRICHT_LON',
+              'utrecht_lat':'DAYMARK_UTRECHT_LAT','utrecht_lon':'DAYMARK_UTRECHT_LON'}
+    # Existing GitHub Secrets might still contain Eindhoven-Centrum coordinates.
+    # Ignore them by default: use a public neighborhood point in Meerhoven.
+    # To enable a private custom origin later, opt in using DAYMARK_ORIGIN_MODE=custom.
+    if os.environ.get('DAYMARK_ORIGIN_MODE') != 'custom':
+        config['origin_lat'], config['origin_lon'] = 51.44148, 5.40563
+        config['origin_area'] = 'Meerhoven (Meerrijk)'
+        env_keys.pop('origin_lat',None); env_keys.pop('origin_lon',None)
+    if config.get('utrecht_lat') is None: config['utrecht_lat']=52.0854
+    if config.get('utrecht_lon') is None: config['utrecht_lon']=5.17556
     for prop, env in env_keys.items():
         if os.environ.get(env):
             try:config[prop]=float(os.environ[env])
@@ -73,30 +86,51 @@ def local_date(value):
     except (TypeError,AttributeError,ValueError): return None
 
 
+def weather_description(code, is_day=True):
+    """Human-readable WMO conditions; clear nights are NOT 'Zonnig'."""
+    if code == 0: return 'Zonnig' if is_day else 'Helder'
+    if code in (1,2): return 'Licht bewolkt'
+    if code == 3: return 'Bewolkt'
+    if code in (45,48): return 'Mist'
+    if code in (51,53,55,56,57): return 'Motregen'
+    if code in (61,63,65,66,67,80,81,82): return 'Regen'
+    if code in (71,73,75,77,85,86): return 'Sneeuw'
+    if code in (95,96,99): return 'Onweer'
+    return 'Wisselvallig' if code is not None else 'Onbekend'
+
+
 def weather(cfg):
+    # Today + 3 calendar days ahead, in Eindhoven local time.
     params={'latitude':cfg['weather_lat'],'longitude':cfg['weather_lon'],
-            'current':'temperature_2m,weather_code,apparent_temperature,wind_speed_10m',
-            'daily':'temperature_2m_max,temperature_2m_min,precipitation_probability_max',
-            'timezone':'Europe/Amsterdam','forecast_days':1}
+            'current':'temperature_2m,weather_code,apparent_temperature,wind_speed_10m,is_day',
+            'daily':'weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max',
+            'timezone':'Europe/Amsterdam','forecast_days':4}
     obj=get_json('https://api.open-meteo.com/v1/forecast?'+urllib.parse.urlencode(params))
-    cur=obj.get('current',{}); daily=obj.get('daily',{})
-    code=cur.get('weather_code')
-    if code==0: desc='Zonnig'
-    elif code in (1,2): desc='Licht bewolkt'
-    elif code==3: desc='Bewolkt'
-    elif code in (45,48): desc='Mist'
-    elif code in (51,53,55,56,57): desc='Motregen'
-    elif code in (61,63,65,66,67,80,81,82): desc='Regen'
-    elif code in (71,73,75,77,85,86): desc='Sneeuw'
-    elif code in (95,96,99): desc='Onweer'
-    else: desc='Wisselvallig'
-    def first(key):
-        x=daily.get(key,[])
-        return x[0] if x else None
+    cur=obj.get('current') or {}; daily=obj.get('daily') or {}
+    code=cur.get('weather_code'); is_day=cur.get('is_day')==1
+    def at(key,index):
+        values=daily.get(key) or []
+        return values[index] if index < len(values) else None
+    future=[]
+    for index in range(1,4):
+        date_text=at('time',index)
+        try: date=dt.date.fromisoformat(date_text)
+        except (TypeError,ValueError): continue
+        dcode=at('weather_code',index)
+        future.append({'date':date, 'code':dcode,
+            'desc':weather_description(dcode),
+            'high':at('temperature_2m_max',index),
+            'low':at('temperature_2m_min',index),
+            'rain':at('precipitation_probability_max',index)})
+    # Current.time from Open-Meteo is already local due timezone param.
+    observed=cur.get('time')
+    try: observed_at=dt.datetime.fromisoformat(observed).replace(tzinfo=TZ)
+    except (ValueError,TypeError): observed_at=None
     return {'temp':cur.get('temperature_2m'), 'feels':cur.get('apparent_temperature'),
-            'desc':desc,'code':code,'high':first('temperature_2m_max'),
-            'low':first('temperature_2m_min'),'rain':first('precipitation_probability_max'),
-            'wind':cur.get('wind_speed_10m')}
+            'desc':weather_description(code,is_day), 'code':code,'is_day':is_day,
+            'observed_at':observed_at,'high':at('temperature_2m_max',0),
+            'low':at('temperature_2m_min',0),'rain':at('precipitation_probability_max',0),
+            'wind':cur.get('wind_speed_10m'),'forecast':future}
 
 
 def football(now):
@@ -279,30 +313,84 @@ def gold():
             'source':'Gold price data by Corgano'}
 
 
-def commute(cfg,name):
-    origin=[cfg.get('origin_lat'),cfg.get('origin_lon')]
-    dest=[cfg.get(f'ericsson_{name}_lat'),cfg.get(f'ericsson_{name}_lon')]
-    key=os.environ.get('TOMTOM_API_KEY')
-    if not key or any(v is None for v in origin+dest):return None
-    coords=f'{origin[0]},{origin[1]}:{dest[0]},{dest[1]}'
-    params=urllib.parse.urlencode({'traffic':'true','departAt':'now','travelMode':'car','key':key})
-    url=f'https://api.tomtom.com/routing/1/calculateRoute/{coords}/json?{params}'
-    data=get_json(url)
-    summary=(data.get('routes') or [{}])[0].get('summary') or {}
-    sec=summary.get('travelTimeInSeconds')
-    return round(sec/60) if sec is not None else None
+def route_period(now):
+    """Switch the direction by EUROPE/AMSTERDAM wall-clock time, including DST.
+
+    Every day:
+      00:00 - 14:59: Meerhoven -> 3 cities
+      15:00 - 20:59: 3 cities -> Meerhoven
+      21:00 - 23:59: Meerhoven -> 3 cities
+    """
+    local = now.astimezone(TZ)
+    mins = local.hour * 60 + local.minute
+    return 'terug' if 15 * 60 <= mins < 21 * 60 else 'heen'
+
+
+def route_next_switch(now):
+    """Display the next switching time in local NL time, not UTC."""
+    local=now.astimezone(TZ)
+    if local.hour < 15:
+        return dt.datetime(local.year,local.month,local.day,15,0,tzinfo=TZ)
+    if local.hour < 21:
+        return dt.datetime(local.year,local.month,local.day,21,0,tzinfo=TZ)
+    next_day=local.date()+dt.timedelta(days=1)
+    return dt.datetime(next_day.year,next_day.month,next_day.day,15,0,tzinfo=TZ)
+
+
+def route_points(cfg, name, now):
+    """Produce a city route in the correct direction; missing coordinates remain unset."""
+    central=[cfg.get('origin_lat'),cfg.get('origin_lon')]
+    # Destination: public city centers for Breda/Maastricht, UU Science Park for Utrecht.
+    other=[cfg.get(f'{name}_lat'),cfg.get(f'{name}_lon')]
+    if any(x is None for x in central+other):return None
+    return (other,central) if route_period(now)=='terug' else (central,other)
+
+
+def commute(cfg, name, now):
+    """Get current traffic-aware driving duration from the official Google Routes API.
+
+    Requires Routes API enabled, billing set up and a restricted Google API key.
+    No key or missing destination => empty result, NEVER a dummy duration.
+    """
+    key=os.environ.get('GOOGLE_MAPS_API_KEY')
+    points=route_points(cfg,name,now)
+    if not key or points is None:return None
+    origin,dest=points
+    def waypoint(latlon):
+        return {'location': {'latLng': {'latitude':latlon[0], 'longitude':latlon[1]}}}
+    request_obj={
+        'origin':waypoint(origin), 'destination':waypoint(dest),
+        'travelMode':'DRIVE', 'routingPreference':'TRAFFIC_AWARE',
+        'languageCode':'nl-NL', 'units':'METRIC',
+    }
+    body=json.dumps(request_obj).encode('utf-8')
+    req=urllib.request.Request(
+        'https://routes.googleapis.com/directions/v2:computeRoutes',
+        data=body, method='POST',
+        headers={'Content-Type':'application/json','X-Goog-Api-Key':key,
+                 'X-Goog-FieldMask':'routes.duration,routes.staticDuration'})
+    with urllib.request.urlopen(req, timeout=12) as response:
+        payload=json.load(response)
+    routes=payload.get('routes') or []
+    if not routes or not routes[0].get('duration'):
+        raise RuntimeError('Google Maps heeft geen route of reistijd teruggegeven')
+    seconds_text=routes[0]['duration']
+    if not isinstance(seconds_text,str) or not seconds_text.endswith('s'):
+        raise ValueError('Google Maps reistijdformaat onbekend')
+    return max(1,round(float(seconds_text[:-1])/60))
 
 
 def demo_data():
     now=dt.datetime.now(TZ)
-    return {'now':now,'demo':True,'weather':{'temp':17,'desc':'Licht bewolkt','high':19,'low':10,'rain':20,'wind':9,'feels':16},
+    return {'now':now,'demo':True,'weather':{'temp':17,'desc':'Licht bewolkt','code':2,'is_day':True,'high':19,'low':10,'rain':20,'wind':9,'feels':16,
+       'observed_at':now,'forecast':[{'date':(now+dt.timedelta(days=i)).date(),'code':c,'high':hi,'low':lo,'rain':rain} for i,(c,hi,lo,rain) in enumerate([(2,18,9,30),(61,16,8,80),(1,17,7,15)],1)]},
             'football':{'last':{'opponent':'Fenerbahce (demo)','opponent_id':'436','opponent_logo':'https://a.espncdn.com/i/teamlogos/soccer/500/436.png','gs_logo':GS_LOGO_URL,'score':'2 - 1','league':'Demo-wedstrijd','date':now-dt.timedelta(days=2),'home':True},
                         'next':{'opponent':'Konyaspor (demo)','opponent_id':'7648','opponent_logo':'https://a.espncdn.com/i/teamlogos/soccer/500/7648.png','gs_logo':GS_LOGO_URL,'date':now+dt.timedelta(days=3),'league':'Demo-wedstrijd','home':True}},
             'stocks':{'NVDA':{'price':210.48,'change':1.2,'points':[2,3,4,4,6,6,5,7,8]},
                       'PLTR':{'price':153.60,'change':-0.4,'points':[4,5,6,5,5,4,7,6,5]},
                       'AAPL':{'price':284.13,'change':0.8,'points':[2,4,3,5,7,6,8,8,9]}},
             'gold':{'price':128300.0,'change':0.3},
-            'routes':{'breda':43,'maastricht':66},
+            'routes':{'breda':43,'utrecht':72,'maastricht':66},
             'errors':[]}
 
 
@@ -318,7 +406,7 @@ def live_data(cfg):
             'football':attempt('voetbal',lambda:football(now),{}),
             'stocks':{name:attempt(name,lambda n=name:stock(n),{}) for name in ('NVDA','PLTR','AAPL')},
             'gold':attempt('goud',gold,{}),
-            'routes':{name:attempt(name,lambda n=name:commute(cfg,n),None) for name in ('breda','maastricht')},
+            'routes':{name:attempt(name,lambda n=name:commute(cfg,n,now),None) for name in ('breda','utrecht','maastricht')},
             'errors':errors}
 
 
@@ -407,6 +495,44 @@ def render(data,cfg):
         pts=[(x+w*i/(len(vals)-1), y+h-3-(a-lo)/(hi-lo)*(h-6)) for i,a in enumerate(vals)]
         d.line(pts,fill=INK,width=3,joint='curve')
         px,py=pts[-1];d.ellipse((px-3,py-3,px+3,py+3),fill=INK)
+    def weather_icon(cx,cy,code,is_day=True,scale=1.0):
+        """Vector icon for actual WMO condition (no font or external icons)."""
+        def xx(v):return int(cx+v*scale)
+        def yy(v):return int(cy+v*scale)
+        def line(pairs,width=3):d.line([(xx(a),yy(b)) for a,b in pairs],fill=INK,width=max(1,int(width*scale)))
+        if code in (95,96,99):
+            # Storm cloud and lightning bolt
+            d.ellipse((xx(-29),yy(-1),xx(0),yy(23)),outline=INK,width=max(1,int(3*scale)))
+            d.ellipse((xx(-2),yy(-7),xx(27),yy(23)),outline=INK,width=max(1,int(3*scale)))
+            line([(-28,20),(24,20)],4)
+            line([(4,23),(-4,35),(8,34),(0,47)],4)
+            return
+        if code in (45,48):
+            for ry in (-13,0,13):line([(-29,ry),(29,ry)],4)
+            return
+        cloud = code in (2,3,51,53,55,56,57,61,63,65,66,67,71,73,75,77,80,81,82,85,86)
+        if code in (0,1,2):
+            if is_day:
+                d.ellipse((xx(-25),yy(-25),xx(4),yy(4)),outline=INK,width=max(1,int(3*scale)))
+                import math as _math
+                for deg in range(0,360,45):
+                    rad=_math.radians(deg)
+                    line([(-10+_math.cos(rad)*22,-10+_math.sin(rad)*22),(-10+_math.cos(rad)*29,-10+_math.sin(rad)*29)],2)
+            else:
+                # Crescent moon; white offset cutout rather than a sun icon.
+                d.ellipse((xx(-25),yy(-25),xx(7),yy(7)),fill=INK)
+                d.ellipse((xx(-16),yy(-31),xx(16),yy(1)),fill=WHITE)
+        if cloud:
+            d.ellipse((xx(-28),yy(-1),xx(0),yy(23)),fill=WHITE,outline=INK,width=max(1,int(3*scale)))
+            d.ellipse((xx(-7),yy(-12),xx(25),yy(23)),fill=WHITE,outline=INK,width=max(1,int(3*scale)))
+            line([(-28,22),(26,22)],3)
+        if code in (51,53,55,56,57,61,63,65,66,67,80,81,82):
+            for sx in (-12,0,12):line([(sx,28),(sx-5,40)],3)
+        elif code in (71,73,75,77,85,86):
+            for sx in (-13,1,15):d.ellipse((xx(sx-2),yy(29),xx(sx+2),yy(33)),fill=INK)
+        if code is None:
+            d.text((cx,cy),'?',font=f(26,'bold'),fill=INK,anchor='mm')
+
     now=data['now']; we=data.get('weather',{}); fb=data.get('football',{});
     stocks=data.get('stocks',{}); gd=data.get('gold',{}); routes=data.get('routes',{})
     gs_logo=logo_image(GS_LOGO_URL,'galatasaray_five_stars_2026')
@@ -426,30 +552,30 @@ def render(data,cfg):
     col_y1,col_y2=111,570
     xw=(33,345);xf=(356,674);xm=(685,991)
     for bounds in (xw,xf,xm):panel(bounds[0],col_y1,bounds[1],col_y2)
-    # WEATHER
+    # WEATHER: current condition + the three upcoming days (no fabricated forecast)
     x=51
     label(x,133,'WEER  /  '+str(cfg['city']).upper())
     temp=we.get('temp')
-    t(x,169,f'{num(temp)}°',102,'heavy')
-    # clean weather symbol, not weather-coded illustration
-    cx,cy=281,197
-    d.ellipse((cx-23,cy-24,cx+15,cy+14),outline=INK,width=4)
-    for angle in [0,45,90,135,180,225,270,315]:
-        a=math.radians(angle)
-        d.line((cx-4+math.cos(a)*27,cy-5+math.sin(a)*27,cx-4+math.cos(a)*35,cy-5+math.sin(a)*35),fill=INK,width=3)
-    d.ellipse((cx-48,cy+13,cx+5,cy+56),fill=WHITE,outline=INK,width=4)
-    d.ellipse((cx-13,cy+21,cx+44,cy+59),fill=WHITE,outline=INK,width=4)
-    rule(cx-47,cy+60,cx+43,cy+60,INK,4)
-    t(x,293,fit(we.get('desc') or 'Geen weergegevens',23,260,'bold'),23,'bold',INK)
+    t(x,167,f'{num(temp)}°',91,'heavy')
+    weather_icon(279,207,we.get('code'),we.get('is_day',True),1.13)
+    t(x,272,fit(we.get('desc') or 'Geen weergegevens',23,277,'bold'),23,'bold',INK)
+    t(x,308,f"MAX {num(we.get('high'))}°   MIN {num(we.get('low'))}°   REGEN {num(we.get('rain'))}%",14,'bold',GRAY)
     rule(51,339,326,339)
-    label(x,352,'VANDAAG')
-    t(x,385,f"MAX  {num(we.get('high'))}°",23,'bold')
-    t(188,385,f"MIN  {num(we.get('low'))}°",23,'bold')
-    rule(51,433,326,433)
-    label(x,446,'NEERSLAGKANS')
-    t(51,476, f"{num(we.get('rain'))}%",34,'heavy')
-    t(178,488,f"WIND {num(we.get('wind'))} km/u",16,'bold',GRAY)
-    t(x,535,'Weerbron: Open-Meteo',12,'regular',GRAY)
+    label(x,354,'KOMENDE 3 DAGEN')
+    future=we.get('forecast') or []
+    for i in range(3):
+        yy=390+i*49
+        if i>0: rule(51,yy-9,325,yy-9,BORDER,1)
+        item=future[i] if i<len(future) else {}
+        day=item.get('date')
+        day_label=f'{DAYS[day.weekday()][:2].upper()} {day.day}' if isinstance(day,dt.date) else '—'
+        t(52,yy,day_label,18,'bold')
+        weather_icon(157,yy+10,item.get('code'),True,0.42)
+        t(251,yy,f"{num(item.get('high'))}°/{num(item.get('low'))}°",19,'bold',anchor='ra')
+        t(326,yy+4,f"{num(item.get('rain'))}%",15,'bold',GRAY,anchor='ra')
+    obs=we.get('observed_at')
+    stamp=f'WEERUPDATE {obs:%H:%M}' if isinstance(obs,dt.datetime) else 'WEERBRON OPEN-METEO'
+    t(51,545,stamp,11,'regular',GRAY)
     # FOOTBALL: club crest + opponent crest on BOTH fixtures
     x=374
     label(x,133,'GALATASARAY  /  FOOTBALL')
@@ -508,20 +634,22 @@ def render(data,cfg):
     t(704,450,euro(gd.get('price')),32,'heavy')
     t(704,497,signed(gd.get('change'))+'  ·  SPOT',15,'bold',GRAY)
     t(704,537,'Gold price data by Corgano',11,'regular',GRAY)
-    # COMMUTE LOWER BAR
+    # COMMUTE LOWER BAR: departure Meerhoven, Utrecht University as center column
     panel(33,587,991,703)
-    label(52,599,'ROUTES  /  AUTO  ·  ACTUELE REISTIJD')
-    rule(515,631,515,688)
-    for i,(name,title) in enumerate([('breda','BREDA'),('maastricht','MAASTRICHT')]):
-        left=52 if i==0 else 534
-        t(left,641,title,18,'bold',GRAY)
-        m=routes.get(name)
-        t(478 if i==0 else 958,634,f'{m} MIN' if m is not None else '— MIN',32,'heavy',INK,anchor='ra')
-        if m is None:t(left,674,'Route nog niet ingesteld',13,'regular',GRAY)
-        else:t(left,674,'Rijtijd, actueel verkeer' if not data['demo'] else 'VOORBEELD-RIJTIJD',13,'regular',GRAY)
+    label(52,598,'ROUTES  /  '+('NAAR MEERHOVEN' if route_period(now)=='terug' else 'VANAF MEERHOVEN')+'  ·  Google Maps')
+    for sep in (356,668):rule(sep,633,sep,688)
+    for i,(name,title) in enumerate([('breda','BREDA'),('utrecht','UTRECHT · UU'),('maastricht','MAASTRICHT')]):
+        left=(52,373,684)[i]
+        right=(337,649,974)[i]
+        t(left,638,title,18 if i!=1 else 17,'bold',GRAY)
+        minutes=routes.get(name)
+        t(right,630,f'{minutes} MIN' if minutes is not None else '— MIN',30,'heavy',INK,anchor='ra')
+        sub='AUTO + VERKEER' if minutes is not None else 'NOG NIET INGESTELD'
+        if name=='utrecht':sub='UU SCIENCE PARK' if minutes is not None else 'UU SCIENCE PARK'
+        t(left,676,sub,12,'bold',GRAY)
     # footer
     rule(33,718,991,718,INK,2)
-    t(34,730,'DAYMARK V3  •  PAPERWHITE 2  •  LANDSCAPE',12,'bold',GRAY)
+    t(34,730,'DAYMARK V3.6  •  PAPERWHITE 2  •  LANDSCAPE',12,'bold',GRAY)
     foot='DEMO • NIET LIVE' if data['demo'] else 'DATA KAN VERTRAAGD ZIJN • ONTBREKEND = —'
     t(991,731,foot,12,'bold',GRAY,anchor='ra')
     return im
@@ -575,7 +703,21 @@ def main():
         status={'generated_at':dt.datetime.now(dt.timezone.utc).isoformat(),
                 'mode':'demo' if args.demo else 'live',
                 'sources_missing':data.get('errors',[]),
-                'routes_configured':all(data['routes'].get(n) is not None for n in ('breda','maastricht')),
+                'routes_configured':all(data['routes'].get(n) is not None for n in ('breda','utrecht','maastricht')),
+                'route_origin':'Meerhoven (Meerrijk) — openbaar wijkmiddelpunt' if route_period(data['now'])=='heen' else 'Breda / Utrecht UU / Maastricht',
+                'route_direction':route_period(data['now']),
+                'route_direction_label':'VANAF MEERHOVEN' if route_period(data['now'])=='heen' else 'NAAR MEERHOVEN',
+                'route_next_switch_nl':route_next_switch(data['now']).isoformat(),
+                'route_provider':'Google Maps Routes API',
+                'route_destination_type':'openbare locaties (Breda/Maastricht centrum; UU Science Park)',
+                'route_key_configured':bool(os.environ.get('GOOGLE_MAPS_API_KEY')), 
+                'route_destinations':['Breda centrum','Universiteit Utrecht - Heidelberglaan 8','Maastricht centrum'] if route_period(data['now'])=='heen' else ['Meerhoven (vanaf Breda)','Meerhoven (vanaf Universiteit Utrecht)','Meerhoven (vanaf Maastricht)'],
+                'weather_temperature':data.get('weather',{}).get('temp'),
+                'weather_description':data.get('weather',{}).get('desc'),
+                'weather_is_day':data.get('weather',{}).get('is_day'),
+                'weather_observed_at_nl':(data.get('weather',{}).get('observed_at') or '').isoformat() if isinstance(data.get('weather',{}).get('observed_at'),dt.datetime) else None,
+                'weather_forecast_days':len(data.get('weather',{}).get('forecast') or []),
+                'route_minutes':data.get('routes',{}),
                 'football_last_available':bool(data.get('football',{}).get('last')),
                 'football_next_available':bool(data.get('football',{}).get('next')),
                 'football_events_checked':data.get('football',{}).get('events_checked',0),
