@@ -100,115 +100,152 @@ def weather(cfg):
 
 
 def football(now):
-    """Last and next Galatasaray fixtures across the Süper Lig and UCL.
+    """Galatasaray, first live ESPN; fallback to dated, verified fixture cache.
 
-    ESPN is an undocumented public feed. Team schedule responses can omit
-    upcoming matches; cross-check league scoreboards within the next 65 days.
-    No fabricated fixtures if the feeds are unavailable.
+    The ESPN API is unofficial and can return 403 or incomplete schedules in
+    GitHub Actions. Curated fixtures are NOT described as live; their source is
+    exposed in status.json so a changed kickoff is never silently concealed.
     """
-    leagues = [('tur.1', 'Super Lig'), ('uefa.champions', 'Champions League')]
+    leagues = [('tur.1', 'Süper Lig'), ('uefa.champions', 'Champions League')]
     events = {}
     successful_sources = 0
+    source_errors = []
 
     def collect(payload, league, league_name):
         for event in payload.get('events', []) or []:
             if not isinstance(event, dict) or not event.get('id'):
                 continue
             key = f"{league}:{event['id']}"
-            # Prefer the response with the richer competition/status details.
             if key not in events or len(str(event)) > len(str(events[key][0])):
                 events[key] = (event, league_name)
 
     for league, league_name in leagues:
+        # Some GitHub Actions IPs are blocked by site.api.espn.com (HTTP 403).
+        # Try ESPN's web API host first, then original. Unofficial interfaces.
         def fetch(path):
-            last_error = None
+            errors = []
             for host in ('site.web.api.espn.com', 'site.api.espn.com'):
                 try:
-                    return get_json(f'https://{host}/apis/site/v2/sports/soccer/{league}/{path}')
-                except Exception as exc:
-                    last_error = exc
-            raise last_error or RuntimeError('ESPN feed niet bereikbaar')
-        # Some ESPN team schedules contain results only, or use an adjacent
-        # season when the season runs across two calendar years.
+                    return get_json(f'https://{host}/apis/site/v2/sports/soccer/{league}/{path}', timeout=8)
+                except Exception as ex:
+                    errors.append(str(ex))
+            raise RuntimeError(' | '.join(errors)[:240])
+
+        # Entire-season responses sometimes contain only completed games.
         for query in ('', f'?season={now.year}', f'?season={now.year+1}'):
             try:
                 collect(fetch(f'teams/432/schedule{query}'), league, league_name)
                 successful_sources += 1
-            except Exception as exc:
-                print(f'ESPN teamkalender {league}{query} niet bereikbaar: {exc}')
+            except Exception as ex:
+                source_errors.append(f'{league} team {query}: {ex}')
 
-        # ESPN scoreboard date ranges list league fixtures, even when the
-        # team's schedule endpoint doesn't list the next fixture.
-        start = (now - dt.timedelta(days=14)).strftime('%Y%m%d')
-        end = (now + dt.timedelta(days=65)).strftime('%Y%m%d')
-        path = 'scoreboard?' + urllib.parse.urlencode({'dates': start+'-'+end, 'limit': 500})
-        try:
-            collect(fetch(path), league, league_name)
-            successful_sources += 1
-        except Exception as exc:
-            print(f'ESPN wedstrijdkalender {league} niet bereikbaar: {exc}')
+        # Date-scoped scoreboards, not one large range. The API may silently
+        # truncate long date ranges. Check weekly windows from -7 to +27 days.
+        for offset in range(-7, 28, 7):
+            begin = (now + dt.timedelta(days=offset)).strftime('%Y%m%d')
+            finish = (now + dt.timedelta(days=offset+6)).strftime('%Y%m%d')
+            params = urllib.parse.urlencode({'dates': begin+'-'+finish, 'limit': 500})
+            try:
+                collect(fetch('scoreboard?'+params), league, league_name)
+                successful_sources += 1
+            except Exception as ex:
+                source_errors.append(f'{league} scoreboard {begin}: {ex}')
 
     def is_gal(side):
-        team = (side.get('team') or {}) if isinstance(side, dict) else {}
+        team = (side.get('team') or {}) if isinstance(side,dict) else {}
         name = str(team.get('displayName') or team.get('name') or '').casefold()
         return str(team.get('id')) == '432' or 'galatasaray' in name
 
     def score(side):
         value = side.get('score')
-        if isinstance(value, dict):
-            value = value.get('displayValue', value.get('value'))
+        if isinstance(value,dict):
+            value=value.get('displayValue',value.get('value'))
         return str(value) if value is not None else '?'
 
-    def logo_for(side):
-        team = side.get('team') or {}
-        logos = team.get('logos') or []
-        return (logos[0].get('href') if logos and isinstance(logos[0], dict) else None) or team.get('logo')
+    def logo(side):
+        team=side.get('team') or {}
+        logos=team.get('logos') or []
+        return (logos[0].get('href') if logos and isinstance(logos[0],dict) else None) or team.get('logo')
 
     past, future = [], []
     for event, league_name in events.values():
-        when = local_date(event.get('date'))
-        if when is None:
-            continue
-        comps = event.get('competitions') or []
-        if not comps or not isinstance(comps[0], dict):
-            continue
-        comp = comps[0]
-        sides = comp.get('competitors') or []
-        if len(sides) != 2:
-            continue
-        us = next((side for side in sides if is_gal(side)), None)
-        them = next((side for side in sides if not is_gal(side)), None)
-        if us is None or them is None:
-            continue
-        status = (event.get('status') or {}).get('type') or (comp.get('status') or {}).get('type') or {}
-        state = status.get('state')
-        completed = status.get('completed') is True or state == 'post'
-        live = state == 'in'
-        opponent = str((them.get('team') or {}).get('displayName') or 'Tegenstander')
-        item = {
-            'opponent': opponent, 'date': when, 'league': league_name,
-            'score': f'{score(us)} - {score(them)}',
-            'home': us.get('homeAway') == 'home',
-            'gs_logo': logo_for(us),
-            'opponent_logo': logo_for(them),
-            'opponent_id': str((them.get('team') or {}).get('id') or ''),
-            'live': live,
+        when=local_date(event.get('date'))
+        if when is None: continue
+        comps=event.get('competitions') or []
+        if not comps or not isinstance(comps[0],dict): continue
+        sides=comps[0].get('competitors') or []
+        if len(sides)!=2: continue
+        us=next((s for s in sides if is_gal(s)),None)
+        them=next((s for s in sides if not is_gal(s)),None)
+        if us is None or them is None:continue
+        status=(event.get('status') or {}).get('type') or (comps[0].get('status') or {}).get('type') or {}
+        state=status.get('state')
+        finished=status.get('completed') is True or state=='post'
+        live=state=='in'
+        item={
+          'opponent':str((them.get('team') or {}).get('displayName') or 'Tegenstander'),
+          'opponent_id':str((them.get('team') or {}).get('id') or ''),
+          'date':when,'league':league_name,'home':us.get('homeAway')=='home',
+          'score':f'{score(us)} - {score(them)}',
+          'gs_logo':None,'opponent_logo':logo(them),
+          'live':live,'source':'espn_live_feed',
         }
-        if completed:
-            past.append(item)
-        elif live or when >= now - dt.timedelta(hours=3):
-            future.append(item)
+        if finished: past.append(item)
+        elif live or when>=now-dt.timedelta(hours=3):future.append(item)
 
-    past.sort(key=lambda item: item['date'], reverse=True)
-    future.sort(key=lambda item: item['date'])
-    if not future:
-        print(f'Geen volgende Galatasaray-wedstrijd gevonden ({successful_sources} ESPN-bronnen bereikbaar).')
-    return {
-        'last': past[0] if past else None,
-        'next': future[0] if future else None,
-        'sources_ok': successful_sources,
-        'events_checked': len(events),
-    }
+    # Curated fallback, checked 2026-10-30. Official Galatasaray UCL schedule,
+    # VfB Stuttgart confirmation, plus public/TFF-derived Super Lig fixtures.
+    # All kickoff times below are EUROPE/AMSTERDAM, not Turkey time.
+    # Do not silently treat this cached calendar as a realtime source.
+    confirmed=[
+      ('2026-11-03T18:45:00','VfB Stuttgart','Champions League', True,'134'),
+      ('2026-11-07T17:00:00','Amedspor','Süper Lig', True,''),
+      ('2026-11-21T14:00:00','Samsunspor','Süper Lig', True,''),
+      ('2026-11-24T18:45:00','Aston Villa','Champions League', True,''),
+      ('2026-11-30T19:00:00','Beşiktaş','Süper Lig', False,''),
+      ('2026-12-08T21:00:00','AEK Athens','Champions League', False,''),
+      ('2027-01-19T18:45:00','Feyenoord','Champions League',True,''),
+      ('2027-01-27T21:00:00','Paris Saint-Germain','Champions League',False,''),
+    ]
+    # 2026-10-30 22:06 local: Konyaspor-Galatasaray finished 0-4;
+    # keep as last-match fallback only if no newer ESPN result exists.
+    previous={'opponent':'Konyaspor', 'opponent_id':'7648',
+      'date':dt.datetime(2026,10,30,20,0,tzinfo=TZ),
+      'league':'Süper Lig','home':False,'score':'4 - 0',
+      'gs_logo':None,
+      'opponent_logo':'https://a.espncdn.com/i/teamlogos/soccer/500/7648.png',
+      'live':False,'source':'verified_result_cache_2026-10-30'}
+    # Score in UI always Galatasaray first; 4-0 Galatasaray victory.
+    if now>=dt.datetime(2026,10,30,22,6,tzinfo=TZ):past.append(previous)
+    for iso, opponent, league, home, teamid in confirmed:
+        when=dt.datetime.fromisoformat(iso).replace(tzinfo=TZ)
+        if when<now-dt.timedelta(hours=3):continue
+        future.append({'opponent':opponent,'opponent_id':teamid,
+            'opponent_logo':f'https://a.espncdn.com/i/teamlogos/soccer/500/{teamid}.png' if teamid else None,
+            'gs_logo':None,'date':when,'league':league,'home':home,
+            'live':False,'source':'verified_schedule_cache_2026-10-30'})
+
+    # Prefer freshest match; if two sources say same opponent/day, use API.
+    # Cached fixtures only fill gaps; no events fabricated in live mode.
+    def normalize(opponent):
+        return ''.join(ch for ch in opponent.casefold() if ch.isalnum())
+    # Group by opponent and local calendar date. Prefer updated API kickoff
+    # over the cached kickoff even when a confirmed time has changed.
+    preferred={}
+    for fixture in future:
+        key=(normalize(fixture['opponent']),fixture['date'].date())
+        older=preferred.get(key)
+        if older is None or (fixture['source']=='espn_live_feed' and older['source']!='espn_live_feed'):
+            preferred[key]=fixture
+    dedup=sorted(preferred.values(),key=lambda fixture:fixture['date'])
+    past.sort(key=lambda e:(e['date'],e['source']=='espn_live_feed'), reverse=True)
+    if not dedup:
+        print('Geen toekomstige Galatasaray-wedstrijd gevonden; ESPN en gecontroleerde cache ontbreken.')
+    return {'last':past[0] if past else None,
+            'next':dedup[0] if dedup else None,
+            'sources_ok':successful_sources,
+            'events_checked':len(events),
+            'feed_errors':source_errors[:3]}
 
 
 def stock(symbol):
@@ -444,7 +481,7 @@ def render(data,cfg):
             t(514,494,f'{at.day} {MONTHS[at.month-1]}  ·  '+until,15,'bold',INK,anchor='mm')
         else:t(514,431,'TIJD ONBEKEND',15,'bold',anchor='mm')
         t(514,473,fit(upcoming.get('opponent','—'),18,266,'bold'),18,'bold',anchor='mm')
-        t(514,534,fit(upcoming.get('league',''),12,266),12,'regular',GRAY,anchor='mm')
+        t(514,534,fit((upcoming.get('league','') + (' · FIKSTUR-CACHE' if upcoming.get('source','').startswith('verified_') else '')),12,266),12,'regular',GRAY,anchor='mm')
     else:
         draw_crest(im,d,377,395,73,90,gs_logo,'GALATASARAY')
         t(475,435,'Nog geen fixture',16,'bold')
@@ -538,7 +575,12 @@ def main():
                 'routes_configured':all(data['routes'].get(n) is not None for n in ('breda','maastricht')),
                 'football_last_available':bool(data.get('football',{}).get('last')),
                 'football_next_available':bool(data.get('football',{}).get('next')),
-                'football_events_checked':data.get('football',{}).get('events_checked',0)}
+                'football_events_checked':data.get('football',{}).get('events_checked',0),
+                'football_next_source':(data.get('football',{}).get('next') or {}).get('source'),
+                'football_next_opponent':(data.get('football',{}).get('next') or {}).get('opponent'),
+                'football_next_kickoff_nl':(data.get('football',{}).get('next') or {}).get('date').isoformat() if (data.get('football',{}).get('next') or {}).get('date') else None,
+                'football_feed_sources_ok':data.get('football',{}).get('sources_ok',0),
+                'football_feed_errors':data.get('football',{}).get('feed_errors',[])}
         (dest/'status.json').write_text(json.dumps(status,indent=2,ensure_ascii=False)+'\n',encoding='utf-8')
         print('Web feed:',dest/'daymark.png')
     if args.install:install(args.kindle,preview,right,left)
