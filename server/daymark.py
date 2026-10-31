@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DAYMARK v3.8.2 • live-rendered Kindle Paperwhite 2 landscape dashboard.
+"""DAYMARK v3.8.3 • live-rendered Kindle Paperwhite 2 landscape dashboard.
 
 Generates both a 1024x758 design preview and a physically rotated
 758x1024 framebuffer image (so a portrait-orientation Kindle can be
@@ -25,6 +25,7 @@ import urllib.parse
 import urllib.request
 from zoneinfo import ZoneInfo
 from PIL import Image, ImageDraw, ImageFont, ImageOps
+import dbs_auto
 
 BASE = pathlib.Path(__file__).resolve().parent
 W,H=1024,758
@@ -420,81 +421,50 @@ def birthday_notice(now):
 
 
 
-# KNVB/Sportlink pages often render the team schedule dynamically and may not
-# expose a reliable machine-readable public endpoint. Prefer an explicit
-# verified JSON list, with an optional externally maintained JSON feed.
-# Never fabricate dates, opponents, or statuses. The label records provenance.
+# Official DBS public Sportlink feed. Both values below are published in the
+# HTML at https://vvdbs.nl/dbs-jo16-1/ (31 Oct 2026), including their
+# team 'programma' widget. Environment variables still override them.
+# The ClientID is a public website feed identifier, not a personal account key.
+# If the club changes its feed or access policy, stop using it and update these.
+DBS_PUBLIC_CLIENT_ID = '6ZYxWvywEK'
+DBS_PUBLIC_TEAM_CODE = '329628'
 DBS_FIXTURES_FILE = BASE / 'dbs_fixtures.json'
 DBS_FEED_ENV = 'DBS_FIXTURES_URL'
-DBS_TEAM_NAME = 'DBS O16-1'
-DBS_CLUB_LOGO_SOURCES = {
-    'DBS': 'https://www.hollandsevelden.nl/images/club_logo_van_voetbalvereniging_dbs_uit_eindhoven.png',
-    'NIEUW WOENSEL': 'https://www.hollandsevelden.nl/images/club_logo_van_voetbalvereniging_nieuw_woensel_uit_eindhoven.png',
-}
+
 
 def dbs_fixture_list(now, cfg=None):
-    """Next verified DBS O16-1 fixture; no past match or guessed fixture.
+    try:
+        manual = json.loads(DBS_FIXTURES_FILE.read_text(encoding='utf-8'))
+    except (ValueError, OSError) as exc:
+        manual = []
+        print('WAARSCHUWING: lokaal DBS-programma niet beschikbaar:',type(exc).__name__)
+    result = dbs_auto.next_fixture(
+        now,
+        client_id=os.environ.get('DBS_SPORTLINK_CLIENT_ID','').strip() or DBS_PUBLIC_CLIENT_ID,
+        team_code=os.environ.get('DBS_SPORTLINK_TEAMCODE','').strip() or DBS_PUBLIC_TEAM_CODE,
+        external_feed=os.environ.get(DBS_FEED_ENV,'').strip(),
+        manual_data=manual,
+        json_fetch=lambda url: get_json(url,timeout=9))
+    if result.get('error'):
+        print('WAARSCHUWING: Sportlink-programma niet bereikbaar:',result['error'])
+    return result
 
-    An optionally configured JSON feed must supply a list or {'fixtures': list};
-    otherwise use the curated fixture file shipped alongside this script.
-    Feed failures fall back to the curated list. Entries are ISO time in NL.
+
+def dbs_club_logo(club, clubcode=None):
+    """Correct logo by Sportlink club relation code, never name-guess rivals.
+
+    Local verified DBS logo is optional. A remote competitor logo is used only
+    when Sportlink provides the opposing club's unique relation code.
     """
-    def validated_entries(payload, source):
-        entries = payload if isinstance(payload,list) else (payload.get('fixtures',[]) if isinstance(payload,dict) else [])
-        clean=[]
-        for entry in entries:
-            if not isinstance(entry,dict):continue
-            when=local_date(entry.get('kickoff'))
-            if when is None:continue
-            home=str(entry.get('home') or '').strip()
-            away=str(entry.get('away') or '').strip()
-            if not home or not away:continue
-            # Only fixtures involving the correct age category (avoid DBS 1).
-            if 'dbs o16-1' not in (home+' | '+away).casefold():continue
-            if when + dt.timedelta(hours=2) < now:continue
-            clean.append({'date':when, 'home':home, 'away':away,
-                          'opponent':away if home.casefold()=='dbs o16-1' else home,
-                          'home_game':home.casefold()=='dbs o16-1',
-                          'venue':str(entry.get('venue') or '').strip(),
-                          'source':source})
-        return clean
-    choices=[]
-    feed_url=os.environ.get(DBS_FEED_ENV,'').strip()
-    if feed_url.startswith('https://'):
-        try:
-            choices=validated_entries(get_json(feed_url,timeout=8),'externe feed')
-        except Exception as exc:
-            print('WAARSCHUWING: DBS-feed niet beschikbaar:',type(exc).__name__)
-    if not choices:
-        try:
-            choices=validated_entries(json.loads(DBS_FIXTURES_FILE.read_text(encoding='utf-8')),'handmatig bevestigd')
-        except (OSError,ValueError) as exc:
-            print('WAARSCHUWING: DBS-fixures niet beschikbaar:',type(exc).__name__)
-    if not choices:
-        return {'fixture':None,'available':False,'source':None}
-    chosen=min(choices,key=lambda e:e['date'])
-    return {'fixture':chosen,'available':True,'source':chosen['source']}
-
-
-def dbs_club_logo(club):
-    """Load real static crests if available; never manufacture a fake crest.
-
-    Use server/club_logos/*.png as highest priority. If absent, a known public
-    image URL is attempted (only when GitHub builds the new PNG, not on Kindle).
-    If a source fails, draw_crest uses a clearly marked letter fallback.
-    """
-    key=str(club).casefold()
-    if 'nieuw woensel' in key:
-        name='nieuw_woensel'; url=DBS_CLUB_LOGO_SOURCES['NIEUW WOENSEL']
-    elif 'dbs' in key:
-        name='dbs'; url=DBS_CLUB_LOGO_SOURCES['DBS']
-    else:
-        return None
-    local=BASE/'club_logos'/(name+'.png')
-    if local.is_file():
-        try:return Image.open(local).convert('RGBA')
-        except Exception:pass
-    return logo_image(url,name)
+    if dbs_auto.is_team(club):
+        p=BASE/'club_logos'/'dbs.png'
+        if p.is_file():
+            try: return Image.open(p).convert('RGBA')
+            except (OSError,ValueError): pass
+    url=dbs_auto.club_logo_url(clubcode)
+    if url:
+        return logo_image(url,'sportlink_'+str(clubcode))
+    return None
 
 
 def stock(symbol):
@@ -648,7 +618,9 @@ def logo_image(url, ident):
     """Fetch+cache opponent ESPN PNG logos or the verified CC0 five-star GS crest."""
     approved = (url == GS_LOGO_URL or
                 url.startswith('https://a.espncdn.com/') or
-                url in DBS_CLUB_LOGO_SOURCES.values())
+                (url.startswith('https://logoapi.voetbal.nl/logo.php?clubcode=') and
+                 dbs_auto.club_logo_url(urllib.parse.parse_qs(
+                     urllib.parse.urlsplit(url).query).get('clubcode',[''])[0]) == url))
     if not url or not approved:
         return None
     LOGO_DIR.mkdir(exist_ok=True)
@@ -662,7 +634,11 @@ def logo_image(url, ident):
             raw=resp.read(2_000_001)
         if len(raw)>2_000_000: return None
         logo=Image.open(io.BytesIO(raw)).convert('RGBA')
-        if logo.width>1600 or logo.height>1600: logo.thumbnail((800,800))
+        if min(logo.size) < 24 or max(logo.size) > 1600:
+            return None
+        if logo.getbbox() is None:
+            return None
+        if logo.width>800 or logo.height>800: logo.thumbnail((800,800))
         logo.save(cache)
         return logo
     except Exception:
@@ -929,8 +905,8 @@ def render(data,cfg):
         if entry:
             # Actual club crests when available; otherwise labelled monograms.
             home,away=entry['home'],entry['away']
-            crest1=dbs_club_logo(home)
-            crest2=dbs_club_logo(away)
+            crest1=dbs_club_logo(home,entry.get('home_club_code'))
+            crest2=dbs_club_logo(away,entry.get('away_club_code'))
             draw_crest(im,d,684,640,43,47,crest1,home)
             draw_crest(im,d,947,640,36,47,crest2,away)
             at=entry['date']
@@ -962,7 +938,7 @@ def render(data,cfg):
             t(974,600,'FILIZ 12 NOV · '+('VANDAAG' if birthday['days']==0 else f"OVER {birthday['days']} DAGEN"),11,'bold',INK,anchor='ra')
     # footer
     rule(33,718,991,718,INK,2)
-    t(34,730,'DAYMARK V3.8.2  •  PAPERWHITE 2  •  LANDSCAPE',12,'bold',GRAY)
+    t(34,730,'DAYMARK V3.8.4  •  PAPERWHITE 2  •  LANDSCAPE',12,'bold',GRAY)
     foot='DEMO • NIET LIVE' if data['demo'] else 'DATA KAN VERTRAAGD ZIJN • ONTBREKEND = —'
     t(991,731,foot,12,'bold',GRAY,anchor='ra')
     return im
@@ -1052,7 +1028,9 @@ def main():
                 'birthday_days':birthday_notice(data['now'])['days'],
                 'dbs_next_kickoff_nl':(data.get('dbs',{}).get('fixture') or {}).get('date').isoformat() if (data.get('dbs',{}).get('fixture') or {}).get('date') else None,
                 'dbs_next_opponent':(data.get('dbs',{}).get('fixture') or {}).get('opponent'),
-                'dbs_schedule_source':data.get('dbs',{}).get('source')}
+                'dbs_schedule_source':data.get('dbs',{}).get('source'),
+                'dbs_feed_error':data.get('dbs',{}).get('error'),
+                'dbs_logo_codes_present':bool((data.get('dbs',{}).get('fixture') or {}).get('home_club_code')) and bool((data.get('dbs',{}).get('fixture') or {}).get('away_club_code'))}
         (dest/'status.json').write_text(json.dumps(status,indent=2,ensure_ascii=False)+'\n',encoding='utf-8')
         print('Web feed:',dest/'daymark.png')
     if args.install:install(args.kindle,preview,right,left)
