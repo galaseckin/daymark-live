@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DAYMARK v3.8 • live-rendered Kindle Paperwhite 2 landscape dashboard.
+"""DAYMARK v3.8.2 • live-rendered Kindle Paperwhite 2 landscape dashboard.
 
 Generates both a 1024x758 design preview and a physically rotated
 758x1024 framebuffer image (so a portrait-orientation Kindle can be
@@ -24,7 +24,7 @@ import shutil
 import urllib.parse
 import urllib.request
 from zoneinfo import ZoneInfo
-from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 BASE = pathlib.Path(__file__).resolve().parent
 W,H=1024,758
@@ -286,66 +286,96 @@ def football(now):
 
 
 def weekend_football(now):
-    """Live ESPN fixtures for weekend; never invent matches or results."""
-    if now.weekday() not in (5,6):
-        return {'matches':[], 'sources_ok':0, 'errors':[]}
-    saturday=(now-dt.timedelta(days=(now.weekday()-5))).replace(hour=0,minute=0,second=0,microsecond=0)
-    monday=saturday+dt.timedelta(days=2)
-    leagues=[('tur.1','SÜPER LIG'),('eng.1','PREMIER LEAGUE'),
-             ('ger.1','BUNDESLIGA'),('esp.1','LA LIGA')]
-    matches=[]; errors=[]; ok=0
-    for league,league_name in leagues:
-        month=saturday.strftime('%Y%m')
-        params=urllib.parse.urlencode({'dates':month,'limit':500})
-        payload=None
-        for host in ('site.web.api.espn.com','site.api.espn.com'):
-            try:
-                payload=get_json(f'https://{host}/apis/site/v2/sports/soccer/{league}/scoreboard?{params}',timeout=8)
-                ok+=1
-                break
-            except Exception as exc:
-                errors.append(f'{league}/{host}: {type(exc).__name__}')
-        if not payload:continue
-        for ev in payload.get('events',[]) or []:
-            when=local_date(ev.get('date'))
-            if not when or not saturday<=when<monday:continue
-            comp=(ev.get('competitions') or [{}])[0]
-            sides=comp.get('competitors') or []
-            if len(sides)!=2:continue
-            home=next((v for v in sides if v.get('homeAway')=='home'),sides[0])
-            away=next((v for v in sides if v.get('homeAway')=='away'),sides[1])
-            h=home.get('team') or {}; a=away.get('team') or {}
-            hn=str(h.get('displayName') or h.get('name') or '')
-            an=str(a.get('displayName') or a.get('name') or '')
-            if not hn or not an:continue
-            # Galatasaray already has a dedicated panel.
-            if 'galatasaray' in (hn+' '+an).casefold():continue
-            status=(ev.get('status') or {}).get('type') or {}
-            state=status.get('state','pre')
-            def score(side):
-                val=side.get('score')
-                if isinstance(val,dict):val=val.get('displayValue',val.get('value'))
-                return str(val) if val is not None else '?'
-            fener='fenerbah' in (hn+' '+an).casefold()
-            # Preserve ESPN source names; use verified three-star textual mark, no fabricated logo.
-            matches.append({'home':hn,'away':an,'date':when,'league':league_name,
-                            'fener':fener,'state':state,
-                            'score':f'{score(home)}-{score(away)}' if state in ('in','post') else None,
-                            'id':str(ev.get('id') or '')})
-    # Rank marquee matches; no automatic preference for Fenerbahçe.
-    big=('liverpool','arsenal','manchester','chelsea','tottenham','bayern',
-         'dortmund','barcelona','real madrid','atlético','atletico','newcastle')
-    def priority(m):
-        names=(m['home']+' '+m['away']).casefold()
-        marquee=sum(v in names for v in big)
-        return (-marquee, m['date'])
-    matches.sort(key=priority)
-    picked=matches[:5]
-    # Display selected games chronologically.
-    picked.sort(key=lambda m:m['date'])
-    return {'matches':picked,'sources_ok':ok,'errors':errors}
+    """Fetch real ESPN fixtures and scores for the entire Dutch weekend.
 
-def superlig_top5():
+    A Saturday/Sunday split across two calendar months MUST query both months;
+    ESPN's monthly scoreboard does not include next month's fixtures.
+    """
+    if now.weekday() not in (5, 6):
+        return {'matches': [], 'sources_ok': 0, 'errors': [], 'months': []}
+    saturday = (now - dt.timedelta(days=now.weekday() - 5)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    monday = saturday + dt.timedelta(days=2)
+    months = sorted({saturday.strftime('%Y%m'),
+                     (monday - dt.timedelta(seconds=1)).strftime('%Y%m')})
+    leagues = [('tur.1', 'SÜPER LIG'), ('eng.1', 'PREMIER LEAGUE'),
+               ('ger.1', 'BUNDESLIGA'), ('esp.1', 'LA LIGA')]
+    matches_by_id = {}
+    errors = []
+    ok = 0
+    for league, league_name in leagues:
+        for month in months:
+            params = urllib.parse.urlencode({'dates': month, 'limit': 500})
+            payload = None
+            failures = []
+            for host in ('site.web.api.espn.com', 'site.api.espn.com'):
+                try:
+                    payload = get_json(
+                        f'https://{host}/apis/site/v2/sports/soccer/{league}/scoreboard?{params}',
+                        timeout=8)
+                    ok += 1
+                    break
+                except Exception as exc:
+                    failures.append(f'{host}: {type(exc).__name__}')
+            if payload is None:
+                errors.append(f'{league}/{month}: '+', '.join(failures))
+                continue
+            for ev in payload.get('events', []) or []:
+                when = local_date(ev.get('date'))
+                if not when or not saturday <= when < monday:
+                    continue
+                comp = (ev.get('competitions') or [{}])[0]
+                sides = comp.get('competitors') or []
+                if len(sides) != 2:
+                    continue
+                home = next((v for v in sides if v.get('homeAway') == 'home'), sides[0])
+                away = next((v for v in sides if v.get('homeAway') == 'away'), sides[1])
+                h, a = home.get('team') or {}, away.get('team') or {}
+                hn = str(h.get('displayName') or h.get('name') or '')
+                an = str(a.get('displayName') or a.get('name') or '')
+                if not hn or not an or 'galatasaray' in (hn+' '+an).casefold():
+                    continue  # Galatasaray has its own panel.
+                status = ev.get('status') or {}
+                state = (status.get('type') or {}).get('state', 'pre')
+                def score(side):
+                    value = side.get('score')
+                    if isinstance(value, dict):
+                        value = value.get('displayValue', value.get('value'))
+                    return str(value) if value is not None else None
+                hs, as_ = score(home), score(away)
+                result = f'{hs}-{as_}' if state in ('in', 'post') and hs is not None and as_ is not None else None
+                # ESPN status clocks vary by league; show a generic label if
+                # the match clock is unavailable, rather than guessing a minute.
+                match_state = 'LIVE' if state == 'in' else 'FT' if state == 'post' else None
+                if state == 'in':
+                    clock = str(status.get('displayClock') or '')
+                    if ':' in clock and clock.split(':', 1)[0].isdigit():
+                        match_state = clock.split(':', 1)[0] + "'"
+                    elif (status.get('type') or {}).get('name') == 'STATUS_HALFTIME':
+                        match_state = 'RUST'
+                identifier = str(ev.get('id') or f'{league}:{hn}:{an}:{when.isoformat()}')
+                matches_by_id[(league, identifier)] = {
+                    'home': hn, 'away': an, 'date': when, 'league': league_name,
+                    'fener': 'fenerbah' in (hn+' '+an).casefold(),
+                    'state': state, 'state_label': match_state, 'score': result,
+                    'id': identifier}
+    matches = list(matches_by_id.values())
+    big = ('liverpool', 'arsenal', 'manchester', 'chelsea', 'tottenham', 'bayern',
+           'dortmund', 'barcelona', 'real madrid', 'atlético', 'atletico', 'newcastle')
+    def priority(match):
+        names = (match['home']+' '+match['away']).casefold()
+        return (-sum(v in names for v in big), match['date'], match['id'])
+    matches.sort(key=priority)
+    # Reserve one place for a Turkish Super Lig match (if present).
+    # All other slots still follow the existing big-match ranking.
+    turkish = [m for m in matches if m['league'] == 'SÜPER LIG']
+    selected = turkish[:1]
+    selected_ids = {(m['league'],m['id']) for m in selected}
+    selected += [m for m in matches if (m['league'],m['id']) not in selected_ids][:5-len(selected)]
+    picked = sorted(selected, key=lambda match: (match['date'], match['id']))
+    return {'matches': picked, 'sources_ok': ok, 'errors': errors, 'months': months}
+
+def superlig_top3():
     """Current Turkish Super Lig standings from ESPN; empty on failed fetch."""
     errors=[]
     for host in ('site.web.api.espn.com','site.api.espn.com'):
@@ -374,7 +404,7 @@ def superlig_top5():
                         rows.sort(key=lambda r:r['rank'])
                     else:
                         rows.sort(key=lambda r:r['points'],reverse=True)
-                    return {'teams':rows[:5],'available':True,'error':None}
+                    return {'teams':rows[:3],'available':True,'error':None}
                 errors.append('Geen ranglijstregels')
             except Exception as exc:
                 errors.append(type(exc).__name__+': '+str(exc)[:75])
@@ -387,6 +417,84 @@ def birthday_notice(now):
     if now.date()>birthday:birthday=dt.date(now.year+1,11,12)
     days=(birthday-now.date()).days
     return {'name':'Filiz','date':birthday,'days':days,'show':now.weekday()>=5 or days<=7}
+
+
+
+# KNVB/Sportlink pages often render the team schedule dynamically and may not
+# expose a reliable machine-readable public endpoint. Prefer an explicit
+# verified JSON list, with an optional externally maintained JSON feed.
+# Never fabricate dates, opponents, or statuses. The label records provenance.
+DBS_FIXTURES_FILE = BASE / 'dbs_fixtures.json'
+DBS_FEED_ENV = 'DBS_FIXTURES_URL'
+DBS_TEAM_NAME = 'DBS O16-1'
+DBS_CLUB_LOGO_SOURCES = {
+    'DBS': 'https://www.hollandsevelden.nl/images/club_logo_van_voetbalvereniging_dbs_uit_eindhoven.png',
+    'NIEUW WOENSEL': 'https://www.hollandsevelden.nl/images/club_logo_van_voetbalvereniging_nieuw_woensel_uit_eindhoven.png',
+}
+
+def dbs_fixture_list(now, cfg=None):
+    """Next verified DBS O16-1 fixture; no past match or guessed fixture.
+
+    An optionally configured JSON feed must supply a list or {'fixtures': list};
+    otherwise use the curated fixture file shipped alongside this script.
+    Feed failures fall back to the curated list. Entries are ISO time in NL.
+    """
+    def validated_entries(payload, source):
+        entries = payload if isinstance(payload,list) else (payload.get('fixtures',[]) if isinstance(payload,dict) else [])
+        clean=[]
+        for entry in entries:
+            if not isinstance(entry,dict):continue
+            when=local_date(entry.get('kickoff'))
+            if when is None:continue
+            home=str(entry.get('home') or '').strip()
+            away=str(entry.get('away') or '').strip()
+            if not home or not away:continue
+            # Only fixtures involving the correct age category (avoid DBS 1).
+            if 'dbs o16-1' not in (home+' | '+away).casefold():continue
+            if when + dt.timedelta(hours=2) < now:continue
+            clean.append({'date':when, 'home':home, 'away':away,
+                          'opponent':away if home.casefold()=='dbs o16-1' else home,
+                          'home_game':home.casefold()=='dbs o16-1',
+                          'venue':str(entry.get('venue') or '').strip(),
+                          'source':source})
+        return clean
+    choices=[]
+    feed_url=os.environ.get(DBS_FEED_ENV,'').strip()
+    if feed_url.startswith('https://'):
+        try:
+            choices=validated_entries(get_json(feed_url,timeout=8),'externe feed')
+        except Exception as exc:
+            print('WAARSCHUWING: DBS-feed niet beschikbaar:',type(exc).__name__)
+    if not choices:
+        try:
+            choices=validated_entries(json.loads(DBS_FIXTURES_FILE.read_text(encoding='utf-8')),'handmatig bevestigd')
+        except (OSError,ValueError) as exc:
+            print('WAARSCHUWING: DBS-fixures niet beschikbaar:',type(exc).__name__)
+    if not choices:
+        return {'fixture':None,'available':False,'source':None}
+    chosen=min(choices,key=lambda e:e['date'])
+    return {'fixture':chosen,'available':True,'source':chosen['source']}
+
+
+def dbs_club_logo(club):
+    """Load real static crests if available; never manufacture a fake crest.
+
+    Use server/club_logos/*.png as highest priority. If absent, a known public
+    image URL is attempted (only when GitHub builds the new PNG, not on Kindle).
+    If a source fails, draw_crest uses a clearly marked letter fallback.
+    """
+    key=str(club).casefold()
+    if 'nieuw woensel' in key:
+        name='nieuw_woensel'; url=DBS_CLUB_LOGO_SOURCES['NIEUW WOENSEL']
+    elif 'dbs' in key:
+        name='dbs'; url=DBS_CLUB_LOGO_SOURCES['DBS']
+    else:
+        return None
+    local=BASE/'club_logos'/(name+'.png')
+    if local.is_file():
+        try:return Image.open(local).convert('RGBA')
+        except Exception:pass
+    return logo_image(url,name)
 
 
 def stock(symbol):
@@ -496,6 +604,7 @@ def demo_data():
             'gold':{'price':128300.0,'change':0.3},
             'weekend':{'matches':[],'sources_ok':0,'errors':[]},
             'standings':{'teams':[],'available':False},
+            'dbs':dbs_fixture_list(now),
             'routes':{'breda':43,'utrecht':72,'maastricht':66},
             'errors':[]}
 
@@ -513,7 +622,8 @@ def live_data(cfg):
             'stocks':{name:attempt(name,lambda n=name:stock(n),{}) for name in ('NVDA','PLTR','AAPL')},
             'gold':attempt('goud',gold,{}),
             'weekend':attempt('weekend_football',lambda:weekend_football(now),{'matches':[]}),
-            'standings':attempt('superlig_top5',superlig_top5,{'teams':[],'available':False}) if now.weekday()>=5 else {'teams':[],'available':False},
+            'standings':attempt('superlig_top3',superlig_top3,{'teams':[],'available':False}) if now.weekday()>=5 else {'teams':[],'available':False},
+            'dbs':dbs_fixture_list(now) if now.weekday()>=5 else {'fixture':None,'available':False,'source':None},
             'routes':{name:attempt(name,lambda n=name:commute(cfg,n,now),None) for name in ('breda','utrecht','maastricht')},
             'errors':errors}
 
@@ -536,7 +646,10 @@ GS_LOGO_URL='https://commons.wikimedia.org/wiki/Special:FilePath/Galatasaray_S.K
 
 def logo_image(url, ident):
     """Fetch+cache opponent ESPN PNG logos or the verified CC0 five-star GS crest."""
-    if not url or (url != GS_LOGO_URL and not url.startswith('https://a.espncdn.com/')):
+    approved = (url == GS_LOGO_URL or
+                url.startswith('https://a.espncdn.com/') or
+                url in DBS_CLUB_LOGO_SOURCES.values())
+    if not url or not approved:
         return None
     LOGO_DIR.mkdir(exist_ok=True)
     ident=''.join(ch for ch in str(ident) if ch.isalnum() or ch in '_-')[:40] or 'unknown'
@@ -603,41 +716,57 @@ def render(data,cfg):
         pts=[(x+w*i/(len(vals)-1), y+h-3-(a-lo)/(hi-lo)*(h-6)) for i,a in enumerate(vals)]
         d.line(pts,fill=INK,width=3,joint='curve')
         px,py=pts[-1];d.ellipse((px-3,py-3,px+3,py+3),fill=INK)
-    def weather_icon(cx,cy,code,is_day=True,scale=1.0):
-        """Vector icon for actual WMO condition (no font or external icons)."""
-        def xx(v):return int(cx+v*scale)
-        def yy(v):return int(cy+v*scale)
-        def line(pairs,width=3):d.line([(xx(a),yy(b)) for a,b in pairs],fill=INK,width=max(1,int(width*scale)))
-        if code in (95,96,99):
-            # Storm cloud and lightning bolt
-            d.ellipse((xx(-29),yy(-1),xx(0),yy(23)),outline=INK,width=max(1,int(3*scale)))
-            d.ellipse((xx(-2),yy(-7),xx(27),yy(23)),outline=INK,width=max(1,int(3*scale)))
-            line([(-28,20),(24,20)],4)
-            line([(4,23),(-4,35),(8,34),(0,47)],4)
-            return
+    def weather_icon(cx, cy, code, is_day=True, scale=1.0):
+        """Compact monochrome WMO icon; clouds are one continuous silhouette."""
+        def point(x, y):
+            return (round(cx+x*scale), round(cy+y*scale))
+        width = max(1, round(2.6*scale))
+        def line(points, thickness=3):
+            d.line([point(x,y) for x,y in points], fill=INK,
+                   width=max(1,round(thickness*scale)), joint='curve')
+        def bezier(p0,p1,p2,p3,steps=10):
+            result=[]
+            for i in range(steps+1):
+                t=i/steps;u=1-t
+                result.append((u**3*p0[0]+3*u*u*t*p1[0]+3*u*t*t*p2[0]+t**3*p3[0],
+                               u**3*p0[1]+3*u*u*t*p1[1]+3*u*t*t*p2[1]+t**3*p3[1]))
+            return result
+        def cloud_shape():
+            # Single closed outline; no overlapping ellipse borders.
+            pts=[]
+            for curve in (
+                ((-24,21),(-36,21),(-37,5),(-25,1)),
+                ((-25,1),(-23,-9),(-13,-14),(-3,-9)),
+                ((-3,-9),(5,-28),(25,-19),(25,-3)),
+                ((25,-3),(40,0),(38,21),(24,21))):
+                pts.extend(bezier(*curve)[1:] if pts else bezier(*curve))
+            pts.append((-24,21))
+            coords=[point(x,y) for x,y in pts]
+            d.polygon(coords, fill=WHITE)
+            d.line(coords+[coords[0]], fill=INK, width=width, joint='curve')
         if code in (45,48):
-            for ry in (-13,0,13):line([(-29,ry),(29,ry)],4)
+            for y in (-13,0,13): line([(-29,y),(29,y)],4)
             return
-        cloud = code in (2,3,51,53,55,56,57,61,63,65,66,67,71,73,75,77,80,81,82,85,86)
+        cloudy=code in (2,3,51,53,55,56,57,61,63,65,66,67,71,73,75,77,80,81,82,85,86,95,96,99)
         if code in (0,1,2):
             if is_day:
-                d.ellipse((xx(-25),yy(-25),xx(4),yy(4)),outline=INK,width=max(1,int(3*scale)))
-                import math as _math
-                for deg in range(0,360,45):
-                    rad=_math.radians(deg)
-                    line([(-10+_math.cos(rad)*22,-10+_math.sin(rad)*22),(-10+_math.cos(rad)*29,-10+_math.sin(rad)*29)],2)
+                d.ellipse((*point(-26,-26),*point(3,3)),outline=INK,width=width)
+                for angle in range(0,360,45):
+                    rad=math.radians(angle)
+                    line([(-11+math.cos(rad)*22,-11+math.sin(rad)*22),
+                          (-11+math.cos(rad)*29,-11+math.sin(rad)*29)],2)
             else:
-                # Crescent moon; white offset cutout rather than a sun icon.
-                d.ellipse((xx(-25),yy(-25),xx(7),yy(7)),fill=INK)
-                d.ellipse((xx(-16),yy(-31),xx(16),yy(1)),fill=WHITE)
-        if cloud:
-            d.ellipse((xx(-28),yy(-1),xx(0),yy(23)),fill=WHITE,outline=INK,width=max(1,int(3*scale)))
-            d.ellipse((xx(-7),yy(-12),xx(25),yy(23)),fill=WHITE,outline=INK,width=max(1,int(3*scale)))
-            line([(-28,22),(26,22)],3)
+                d.ellipse((*point(-25,-25),*point(7,7)), fill=INK)
+                d.ellipse((*point(-16,-31),*point(16,1)), fill=WHITE)
+        if cloudy:
+            cloud_shape()
         if code in (51,53,55,56,57,61,63,65,66,67,80,81,82):
-            for sx in (-12,0,12):line([(sx,28),(sx-5,40)],3)
+            for x in (-12,0,12):line([(x,28),(x-5,40)],3)
         elif code in (71,73,75,77,85,86):
-            for sx in (-13,1,15):d.ellipse((xx(sx-2),yy(29),xx(sx+2),yy(33)),fill=INK)
+            for x in (-13,1,15):
+                d.ellipse((*point(x-2,29),*point(x+2,33)),fill=INK)
+        elif code in (95,96,99):
+            line([(4,22),(-5,35),(5,35),(-4,47)],4)
         if code is None:
             d.text((cx,cy),'?',font=f(26,'bold'),fill=INK,anchor='mm')
 
@@ -741,8 +870,11 @@ def render(data,cfg):
             stamp=game['date'].strftime('%a %H:%M').upper()
             result=game.get('score')
             t(704,yy+35,game['league'],11,'regular',GRAY)
-            t(973,yy+34,result if result else stamp,13,'bold',INK,anchor='ra')
-        t(704,541,'ESPN  ·  tijden NL  ·  live indien beschikbaar',10,'regular',GRAY)
+            state_label=game.get('state_label')
+            match_label=(f'{state_label}  {result}' if state_label and result else
+                         result or stamp)
+            t(973,yy+34,match_label,13,'bold',INK,anchor='ra')
+        t(704,541,f"ESPN  ·  CHECK {now:%H:%M} NL  ·  ±30 MIN",10,'regular',GRAY)
     else:
         # MARKETS
         x=704
@@ -763,39 +895,52 @@ def render(data,cfg):
         t(704,450,euro(gd.get('price')),32,'heavy')
         t(704,497,signed(gd.get('change'))+'  ·  SPOT',15,'bold',GRAY)
         t(704,537,'Gold price data by Corgano',11,'regular',GRAY)
-    # WEEKEND LOWER BAR: birthday / real league standings / weekend weather.
+    # WEEKEND LOWER BAR: birthday / Super Lig Top 3 / next DBS O16-1.
     panel(33,587,991,703)
     if now.weekday() in (5,6):
-        label(52,598,'WEEKEND  /  VERJAARDAG · SÜPER LIG · WEER')
+        label(52,598,'WEEKEND  /  VERJAARDAG · SÜPER LIG TOP 3 · DBS O16-1')
         for sep in (356,668):rule(sep,633,sep,688)
+
+        # Two E Ink-friendly balloons: one dark, one white outlined.
+        def birthday_balloons(x,y):
+            d.ellipse((x,y,x+18,y+24),fill=INK,outline=INK,width=2)
+            d.ellipse((x+24,y-1,x+43,y+24),fill=WHITE,outline=INK,width=2)
+            d.polygon([(x+7,y+23),(x+11,y+27),(x+15,y+23)],fill=INK)
+            d.polygon([(x+31,y+23),(x+34,y+27),(x+37,y+23)],outline=INK)
+            d.line([(x+11,y+27),(x+10,y+36),(x+15,y+42)],fill=INK,width=1)
+            d.line([(x+34,y+27),(x+35,y+35),(x+29,y+42)],fill=INK,width=1)
         birthday=birthday_notice(now)
-        t(52,637,'FILIZ  ·  12 NOVEMBER',17,'bold')
-        t(52,669,'VANDAAG!' if birthday['days']==0 else f"OVER {birthday['days']} DAGEN",18,'heavy')
+        birthday_balloons(52,637)
+        t(107,635,'FILIZ  ·  12 NOVEMBER',16,'bold')
+        t(107,666,'VANDAAG!' if birthday['days']==0 else f"OVER {birthday['days']} DAGEN",16,'heavy')
+
         teams=(data.get('standings') or {}).get('teams') or []
+        t(373,634,'TOP 3',12,'bold',GRAY)
         if teams:
-            # Five compact rows in the available 68px: no fake rank or points.
-            for i,team in enumerate(teams[:5]):
-                yy=628+i*14
-                name=fit(team['name'],11,175,'bold')
-                t(374,yy,f"{i+1}. {name}",11,'bold' if 'galatasaray' in team['name'].casefold() else 'regular')
-                t(649,yy,str(team['points'])+' PT',11,'bold',INK,anchor='ra')
+            for i,team in enumerate(teams[:3]):
+                yy=651+i*16
+                name=fit(team['name'],12,193,'bold')
+                t(374,yy,f"{i+1}. {name}",12,'bold' if 'galatasaray' in team['name'].casefold() else 'regular')
+                t(651,yy,str(team['points'])+' PT',12,'bold',INK,anchor='ra')
         else:
-            t(374,650,'Stand niet beschikbaar',14,'bold',GRAY)
-        # Forecast includes today and next 3 days, enough for Saturday+Sunday.
-        forecasts=we.get('forecast') or []
-        today=now.date()
-        weather_days=[]
-        for date in (today,today+dt.timedelta(days=1)):
-            if date.weekday() not in (5,6):continue
-            if date==today:
-                weather_days.append((date,we.get('high'),we.get('low'),we.get('rain')))
-            else:
-                day=next((item for item in forecasts if item.get('date')==date),{})
-                weather_days.append((date,day.get('high'),day.get('low'),day.get('rain')))
-        for i,(date,high,low,rain) in enumerate(weather_days):
-            yy=636+i*29
-            t(685,yy,f"{DAYS[date.weekday()][:2].upper()}  {num(high)}°/{num(low)}°",17,'bold')
-            t(974,yy+2,f"{num(rain)}% REGEN",12,'bold',GRAY,anchor='ra')
+            t(374,660,'Stand niet beschikbaar',14,'bold',GRAY)
+
+        entry=(data.get('dbs') or {}).get('fixture')
+        if entry:
+            # Actual club crests when available; otherwise labelled monograms.
+            home,away=entry['home'],entry['away']
+            crest1=dbs_club_logo(home)
+            crest2=dbs_club_logo(away)
+            draw_crest(im,d,684,640,43,47,crest1,home)
+            draw_crest(im,d,947,640,36,47,crest2,away)
+            at=entry['date']
+            t(836,639, f"{DAYS[at.weekday()][:2].upper()} {at.day:02d} {MONTHS[at.month-1].upper()} · {at:%H:%M}",15,'heavy',INK,anchor='mt')
+            desc=fit(entry['opponent'].upper(),13,198,'bold')
+            t(836,662,desc,13,'bold',INK,anchor='mt')
+            t(836,681,'THUIS' if entry['home_game'] else 'UIT',11,'bold',GRAY,anchor='mt')
+        else:
+            t(685,645,'DBS O16-1',16,'bold')
+            t(685,670,'Geen bevestigde match',13,'regular',GRAY)
     else:
         # COMMUTE LOWER BAR: departure Meerhoven, Utrecht University as center column
         panel(33,587,991,703)
@@ -817,33 +962,10 @@ def render(data,cfg):
             t(974,600,'FILIZ 12 NOV · '+('VANDAAG' if birthday['days']==0 else f"OVER {birthday['days']} DAGEN"),11,'bold',INK,anchor='ra')
     # footer
     rule(33,718,991,718,INK,2)
-    t(34,730,'DAYMARK V3.8  •  PAPERWHITE 2  •  LANDSCAPE',12,'bold',GRAY)
+    t(34,730,'DAYMARK V3.8.2  •  PAPERWHITE 2  •  LANDSCAPE',12,'bold',GRAY)
     foot='DEMO • NIET LIVE' if data['demo'] else 'DATA KAN VERTRAAGD ZIJN • ONTBREKEND = —'
     t(991,731,foot,12,'bold',GRAY,anchor='ra')
     return im
-
-
-def sharpen_for_eink(image):
-    """Conservative native-resolution e-ink enhancement; no fake extra pixels.
-
-    Slightly darken mid-gray text and increase edge definition while retaining
-    the original geometry and grayscale image mode. Avoid 1-bit dithering,
-    which can make text grainy on the Paperwhite's grayscale screen.
-    """
-    image = image.convert('L')
-    lut = []
-    for value in range(256):
-        # Preserve near-white backgrounds and darkest strokes; make faint
-        # labels and rules more legible without turning the UI black.
-        if value >= 242:
-            adjusted = value
-        elif value <= 42:
-            adjusted = value
-        else:
-            adjusted = max(0, round(value - 0.085 * (value - 42) * (242 - value) / 200))
-        lut.append(adjusted)
-    image = image.point(lut)
-    return image.filter(ImageFilter.UnsharpMask(radius=0.65, percent=115, threshold=3))
 
 
 def save_images(image):
@@ -874,7 +996,6 @@ def install(kindle,preview,right,left):
 def main():
     p=argparse.ArgumentParser()
     p.add_argument('--demo',action='store_true',help='voorbeeldcijfers met duidelijk DEMO-label')
-    p.add_argument('--sharp',action='store_true',help='maak daarnaast een aparte Sharp Edition voor vergelijking')
     p.add_argument('--install',action='store_true',help='kopieer landscape-afbeelding en launcher naar Kindle via USB')
     p.add_argument('--kindle',default='/Volumes/Kindle')
     p.add_argument('--output-dir',help='map voor de publieke Kindle-PNG (GitHub Pages)')
@@ -883,15 +1004,6 @@ def main():
     data=demo_data() if args.demo else live_data(cfg)
     img=render(data,cfg)
     preview,right,left=save_images(img)
-    if args.sharp:
-        enhanced=sharpen_for_eink(img)
-        sharp_preview=BASE/'daymark_sharp_preview.png'
-        sharp_right=BASE/'daymark_sharp_kindle_right.png'
-        sharp_left=BASE/'daymark_sharp_kindle_left.png'
-        enhanced.save(sharp_preview,optimize=True)
-        enhanced.rotate(90,expand=True).save(sharp_right,optimize=True)
-        enhanced.rotate(-90,expand=True).save(sharp_left,optimize=True)
-        print(f'Sharp Edition: {sharp_preview} / {sharp_right}')
     errs=BASE/'last_errors.log'
     errs.write_text('\n'.join(data.get('errors',[]))+'\n',encoding='utf-8')
     print(f'Gemaakt: {preview} (1024x758), Kindle-image: {right} (758x1024)')
@@ -900,8 +1012,6 @@ def main():
         dest=pathlib.Path(args.output_dir)
         dest.mkdir(parents=True,exist_ok=True)
         shutil.copy2(right,dest/'daymark.png')
-        if args.sharp:
-            shutil.copy2(sharp_right,dest/'daymark_sharp.png')
         if (BASE/'ATTRIBUTION.md').exists():
             shutil.copy2(BASE/'ATTRIBUTION.md',dest/'ATTRIBUTION.md')
         status={'generated_at':dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -933,9 +1043,16 @@ def main():
                 'weekend_matches':len((data.get('weekend') or {}).get('matches') or []),
                 'weekend_sources_ok':(data.get('weekend') or {}).get('sources_ok',0),
                 'weekend_errors':(data.get('weekend') or {}).get('errors',[]),
+                'weekend_queried_months':(data.get('weekend') or {}).get('months',[]),
+                'weekend_selected_matches':[{'id':m['id'],'home':m['home'],
+                    'away':m['away'],'state':m['state'],'score':m['score']}
+                    for m in (data.get('weekend') or {}).get('matches',[])],
                 'standings_available':(data.get('standings') or {}).get('available',False),
                 'standings_error':(data.get('standings') or {}).get('error'),
-                'birthday_days':birthday_notice(data['now'])['days']}
+                'birthday_days':birthday_notice(data['now'])['days'],
+                'dbs_next_kickoff_nl':(data.get('dbs',{}).get('fixture') or {}).get('date').isoformat() if (data.get('dbs',{}).get('fixture') or {}).get('date') else None,
+                'dbs_next_opponent':(data.get('dbs',{}).get('fixture') or {}).get('opponent'),
+                'dbs_schedule_source':data.get('dbs',{}).get('source')}
         (dest/'status.json').write_text(json.dumps(status,indent=2,ensure_ascii=False)+'\n',encoding='utf-8')
         print('Web feed:',dest/'daymark.png')
     if args.install:install(args.kindle,preview,right,left)
