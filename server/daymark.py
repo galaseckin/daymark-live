@@ -24,7 +24,7 @@ import shutil
 import urllib.parse
 import urllib.request
 from zoneinfo import ZoneInfo
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageFilter
 
 BASE = pathlib.Path(__file__).resolve().parent
 W,H=1024,758
@@ -823,6 +823,29 @@ def render(data,cfg):
     return im
 
 
+def sharpen_for_eink(image):
+    """Conservative native-resolution e-ink enhancement; no fake extra pixels.
+
+    Slightly darken mid-gray text and increase edge definition while retaining
+    the original geometry and grayscale image mode. Avoid 1-bit dithering,
+    which can make text grainy on the Paperwhite's grayscale screen.
+    """
+    image = image.convert('L')
+    lut = []
+    for value in range(256):
+        # Preserve near-white backgrounds and darkest strokes; make faint
+        # labels and rules more legible without turning the UI black.
+        if value >= 242:
+            adjusted = value
+        elif value <= 42:
+            adjusted = value
+        else:
+            adjusted = max(0, round(value - 0.085 * (value - 42) * (242 - value) / 200))
+        lut.append(adjusted)
+    image = image.point(lut)
+    return image.filter(ImageFilter.UnsharpMask(radius=0.65, percent=115, threshold=3))
+
+
 def save_images(image):
     preview=BASE/'daymark_v2_preview.png'
     right=BASE/'daymark_v2_kindle_right.png'
@@ -851,6 +874,7 @@ def install(kindle,preview,right,left):
 def main():
     p=argparse.ArgumentParser()
     p.add_argument('--demo',action='store_true',help='voorbeeldcijfers met duidelijk DEMO-label')
+    p.add_argument('--sharp',action='store_true',help='maak daarnaast een aparte Sharp Edition voor vergelijking')
     p.add_argument('--install',action='store_true',help='kopieer landscape-afbeelding en launcher naar Kindle via USB')
     p.add_argument('--kindle',default='/Volumes/Kindle')
     p.add_argument('--output-dir',help='map voor de publieke Kindle-PNG (GitHub Pages)')
@@ -859,6 +883,15 @@ def main():
     data=demo_data() if args.demo else live_data(cfg)
     img=render(data,cfg)
     preview,right,left=save_images(img)
+    if args.sharp:
+        enhanced=sharpen_for_eink(img)
+        sharp_preview=BASE/'daymark_sharp_preview.png'
+        sharp_right=BASE/'daymark_sharp_kindle_right.png'
+        sharp_left=BASE/'daymark_sharp_kindle_left.png'
+        enhanced.save(sharp_preview,optimize=True)
+        enhanced.rotate(90,expand=True).save(sharp_right,optimize=True)
+        enhanced.rotate(-90,expand=True).save(sharp_left,optimize=True)
+        print(f'Sharp Edition: {sharp_preview} / {sharp_right}')
     errs=BASE/'last_errors.log'
     errs.write_text('\n'.join(data.get('errors',[]))+'\n',encoding='utf-8')
     print(f'Gemaakt: {preview} (1024x758), Kindle-image: {right} (758x1024)')
@@ -867,6 +900,8 @@ def main():
         dest=pathlib.Path(args.output_dir)
         dest.mkdir(parents=True,exist_ok=True)
         shutil.copy2(right,dest/'daymark.png')
+        if args.sharp:
+            shutil.copy2(sharp_right,dest/'daymark_sharp.png')
         if (BASE/'ATTRIBUTION.md').exists():
             shutil.copy2(BASE/'ATTRIBUTION.md',dest/'ATTRIBUTION.md')
         status={'generated_at':dt.datetime.now(dt.timezone.utc).isoformat(),
