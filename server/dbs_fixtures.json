@@ -1,0 +1,19 @@
+{
+  "description": "Handmatig geverifieerde DBS O16-1 wedstrijden; werk schema bij of configureer DBS_FIXTURES_URL voor betrouwbare automatische feed.",
+  "fixtures": [
+    {
+      "kickoff": "2026-11-04T19:15:00+01:00",
+      "home": "Nieuw Woensel O16-1",
+      "away": "DBS O16-1",
+      "venue": "Sportpark Eindhoven Noord",
+      "source_url": "Door gebruiker aangeleverd Sportlink/KNVB-programma"
+    },
+    {
+      "kickoff": "2026-12-05T13:45:00+01:00",
+      "home": "DBS O16-1",
+      "away": "VV Nieuwkuijk O16-1",
+      "venue": "Sportpark Meerhoven",
+      "source_url": "https://www.vvnieuwkuijk.nl/113/31385/uitslagen/wedstrijd-details/?tab=1"
+    }
+  ]
+}
