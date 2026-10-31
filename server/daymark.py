@@ -748,10 +748,17 @@ def render(data,cfg):
 
     now=data['now']; we=data.get('weather',{}); fb=data.get('football',{});
     stocks=data.get('stocks',{}); gd=data.get('gold',{}); routes=data.get('routes',{})
-    gs_logo=logo_image(GS_LOGO_URL,'galatasaray_five_stars_2026')
-    # Do not silently substitute an obsolete (4-star) logo. Explicit five stars only.
-    if gs_logo is None:
-        print('WAARSCHUWING: vijfsterrenlogo ontbreekt; duidelijke 5-sterren-tekstfallback (geen oud logo).')
+    # Fixed five-star asset in this repository. Never fetch a club's own crest
+    # on every GitHub Actions render: a transient outage used to cause the GS oval.
+    gs_path=BASE/'assets'/'galatasaray_five_stars.png'
+    try:
+        with Image.open(gs_path) as source:
+            if source.format != 'PNG' or min(source.size) < 100:
+                raise ValueError('geen bruikbare PNG')
+            gs_logo=source.convert('RGBA')
+            gs_logo.load()
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f'Vaste Galatasaray-logo ontbreekt/ongeldig: {gs_path} ({exc}). Bestaande gepubliceerde afbeelding blijft behouden.') from exc
     # TOP / identity bar
     t(33,18,'DAYMARK',33,'heavy')
     t(34,61,'LIVE DAILY BRIEF',12,'bold',GRAY)
