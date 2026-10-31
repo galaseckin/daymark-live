@@ -41,7 +41,7 @@ jobs:
           DAYMARK_BREDA_LON: ${{ secrets.DAYMARK_BREDA_LON }}
           DAYMARK_MAASTRICHT_LAT: ${{ secrets.DAYMARK_MAASTRICHT_LAT }}
           DAYMARK_MAASTRICHT_LON: ${{ secrets.DAYMARK_MAASTRICHT_LON }}
-        run: python server/daymark.py --output-dir site
+        run: python server/daymark.py --output-dir site --sharp
       - name: Setup GitHub Pages
         uses: actions/configure-pages@v5
       - name: Upload site
