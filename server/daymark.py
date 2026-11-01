@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DAYMARK v3.8.3 • live-rendered Kindle Paperwhite 2 landscape dashboard.
+"""DAYMARK v3.8.6 • live-rendered Kindle Paperwhite 2 landscape dashboard.
 
 Generates both a 1024x758 design preview and a physically rotated
 758x1024 framebuffer image (so a portrait-orientation Kindle can be
@@ -132,6 +132,20 @@ def weather(cfg):
             'observed_at':observed_at,'high':at('temperature_2m_max',0),
             'low':at('temperature_2m_min',0),'rain':at('precipitation_probability_max',0),
             'wind':cur.get('wind_speed_10m'),'forecast':future}
+
+
+def gs_result_letter(score_text):
+    """Return W/L/G for a verified finished GS score ('GS - opponent').
+
+    W=Winst, L=Verlies, G=Gelijk. Unknown/partial scores never count.
+    """
+    if not isinstance(score_text, str):
+        return None
+    scores = [part.strip() for part in score_text.split('-')]
+    if len(scores) != 2 or not all(part.isdecimal() for part in scores):
+        return None
+    gs_goals, opponent_goals = map(int, scores)
+    return 'W' if gs_goals > opponent_goals else 'L' if gs_goals < opponent_goals else 'G'
 
 
 def football(now):
@@ -276,11 +290,26 @@ def football(now):
             preferred[key]=fixture
     dedup=sorted(preferred.values(),key=lambda fixture:fixture['date'])
     past.sort(key=lambda e:(e['date'],e['source']=='espn_live_feed'), reverse=True)
+    # The form uses only completed games with actual scores. Two sources can
+    # describe the same fixture differently; deduplicate by competition + day.
+    # ESPN wins over the older confirmed-result fallback if both are valid.
+    completed_by_day = {}
+    for game in past:
+        if gs_result_letter(game.get('score')) is None:
+            continue
+        key = (game['league'], game['date'].astimezone(TZ).date())
+        earlier = completed_by_day.get(key)
+        if earlier is None or (game.get('source') == 'espn_live_feed' and
+                               earlier.get('source') != 'espn_live_feed'):
+            completed_by_day[key] = game
+    recent_completed = sorted(completed_by_day.values(), key=lambda g: g['date'], reverse=True)[:5]
+    form = [gs_result_letter(game['score']) for game in recent_completed]
     if not dedup:
         print('Geen toekomstige Galatasaray-wedstrijd gevonden; ESPN en gecontroleerde cache ontbreken.')
     return {'last':past[0] if past else None,
             'next':dedup[0] if dedup else None,
             'upcoming': dedup[1:6],
+            'form': form,
             'sources_ok':successful_sources,
             'events_checked':len(events),
             'feed_errors':source_errors[:3]}
@@ -414,14 +443,6 @@ def superlig_top3():
             except Exception as exc:
                 errors.append(type(exc).__name__+': '+str(exc)[:75])
     return {'teams':[],'available':False,'error':'; '.join(errors[-2:])}
-
-
-def birthday_notice(now):
-    """Filiz: 12 November; show 7-day countdown on weekdays, always on weekends."""
-    birthday=dt.date(now.year,11,12)
-    if now.date()>birthday:birthday=dt.date(now.year+1,11,12)
-    days=(birthday-now.date()).days
-    return {'name':'Filiz','date':birthday,'days':days,'show':now.weekday()>=5 or days<=7}
 
 
 
@@ -571,7 +592,8 @@ def demo_data():
     return {'now':now,'demo':True,'weather':{'temp':17,'desc':'Licht bewolkt','code':2,'is_day':True,'high':19,'low':10,'rain':20,'wind':9,'feels':16,
        'observed_at':now,'forecast':[{'date':(now+dt.timedelta(days=i)).date(),'code':c,'high':hi,'low':lo,'rain':rain} for i,(c,hi,lo,rain) in enumerate([(2,18,9,30),(61,16,8,80),(1,17,7,15)],1)]},
             'football':{'last':{'opponent':'Fenerbahce (demo)','opponent_id':'436','opponent_logo':'https://a.espncdn.com/i/teamlogos/soccer/500/436.png','gs_logo':GS_LOGO_URL,'score':'2 - 1','league':'Demo-wedstrijd','date':now-dt.timedelta(days=2),'home':True},
-                        'next':{'opponent':'Konyaspor (demo)','opponent_id':'7648','opponent_logo':'https://a.espncdn.com/i/teamlogos/soccer/500/7648.png','gs_logo':GS_LOGO_URL,'date':now+dt.timedelta(days=3),'league':'Demo-wedstrijd','home':True}},
+                        'next':{'opponent':'Konyaspor (demo)','opponent_id':'7648','opponent_logo':'https://a.espncdn.com/i/teamlogos/soccer/500/7648.png','gs_logo':GS_LOGO_URL,'date':now+dt.timedelta(days=3),'league':'Demo-wedstrijd','home':True},
+                        'form':['W','L','G','W','W']},
             'stocks':{'NVDA':{'price':210.48,'change':1.2,'points':[2,3,4,4,6,6,5,7,8]},
                       'PLTR':{'price':153.60,'change':-0.4,'points':[4,5,6,5,5,4,7,6,5]},
                       'AAPL':{'price':284.13,'change':0.8,'points':[2,4,3,5,7,6,8,8,9]}},
@@ -864,24 +886,30 @@ def render(data,cfg):
             league=league+'  ·  CACHE'
         t(704,yy+50,fit(league,11,269),11,'regular',GRAY)
     t(704,548,'CACHE = eerder bevestigde planning',10,'regular',GRAY)
-    # WEEKEND LOWER BAR: birthday / Super Lig Top 3 / next DBS O16-1.
+    # WEEKEND LOWER BAR: Galatasaray form / Super Lig Top 3 / next DBS O16-1.
     panel(33,587,991,703)
     if now.weekday() in (5,6):
-        label(52,598,'WEEKEND  /  VERJAARDAG · SÜPER LIG TOP 3 · DBS O16-1')
+        label(52,598,'WEEKEND  /  GS VORM · SÜPER LIG TOP 3 · DBS O16-1')
         for sep in (356,668):rule(sep,633,sep,688)
 
-        # Two E Ink-friendly balloons: one dark, one white outlined.
-        def birthday_balloons(x,y):
-            d.ellipse((x,y,x+18,y+24),fill=INK,outline=INK,width=2)
-            d.ellipse((x+24,y-1,x+43,y+24),fill=WHITE,outline=INK,width=2)
-            d.polygon([(x+7,y+23),(x+11,y+27),(x+15,y+23)],fill=INK)
-            d.polygon([(x+31,y+23),(x+34,y+27),(x+37,y+23)],outline=INK)
-            d.line([(x+11,y+27),(x+10,y+36),(x+15,y+42)],fill=INK,width=1)
-            d.line([(x+34,y+27),(x+35,y+35),(x+29,y+42)],fill=INK,width=1)
-        birthday=birthday_notice(now)
-        birthday_balloons(52,637)
-        t(107,635,'FILIZ  ·  12 NOVEMBER',16,'bold')
-        t(107,666,'VANDAAG!' if birthday['days']==0 else f"OVER {birthday['days']} DAGEN",16,'heavy')
+        # Five compact monochrome circles; newest completed game at left.
+        # Display only verified outcomes. Empty circles mean "not available".
+        t(52,624,'GS VORM  ·  LAATSTE 5',13,'bold',GRAY)
+        form=(fb.get('form') or [])[:5]
+        for i in range(5):
+            result=form[i] if i < len(form) else None
+            cx,cy=74+i*55,664
+            radius=18
+            # Win: dark filled; loss: bright, double outline; draw: pale filled.
+            fill = INK if result=='W' else PALE if result=='G' else WHITE
+            d.ellipse((cx-radius,cy-radius,cx+radius,cy+radius),
+                      fill=fill,outline=INK,width=2)
+            if result=='L':
+                d.ellipse((cx-radius+3,cy-radius+3,cx+radius-3,cy+radius-3),
+                          outline=MID,width=1)
+            t(cx,cy,result if result else '·',17,'heavy',
+              WHITE if result=='W' else INK,anchor='mm')
+        t(52,686,'NIEUWSTE LINKS  ·  W WINST / L VERLIES / G GELIJK',10,'regular',GRAY)
 
         teams=(data.get('standings') or {}).get('teams') or []
         t(373,634,'TOP 3',12,'bold',GRAY)
@@ -924,14 +952,9 @@ def render(data,cfg):
             sub='AUTO + VERKEER' if minutes is not None else 'NOG NIET INGESTELD'
             if name=='utrecht':sub='UU SCIENCE PARK' if minutes is not None else 'UU SCIENCE PARK'
             t(left,676,sub,12,'bold',GRAY)
-        # Birthday notice is added only during the 7-day countdown.
-        birthday=birthday_notice(now)
-        if birthday['show']:
-            # Small header text; preserve all three existing route metrics.
-            t(974,600,'FILIZ 12 NOV · '+('VANDAAG' if birthday['days']==0 else f"OVER {birthday['days']} DAGEN"),11,'bold',INK,anchor='ra')
     # footer
     rule(33,718,991,718,INK,2)
-    t(34,730,'DAYMARK V3.8.5  •  PAPERWHITE 2  •  LANDSCAPE',12,'bold',GRAY)
+    t(34,730,'DAYMARK V3.8.6  •  PAPERWHITE 2  •  LANDSCAPE',12,'bold',GRAY)
     foot='DEMO • NIET LIVE' if data['demo'] else 'DATA KAN VERTRAAGD ZIJN • ONTBREKEND = —'
     t(991,731,foot,12,'bold',GRAY,anchor='ra')
     return im
@@ -1023,7 +1046,7 @@ def main():
                     for m in (data.get('weekend') or {}).get('matches',[])],
                 'standings_available':(data.get('standings') or {}).get('available',False),
                 'standings_error':(data.get('standings') or {}).get('error'),
-                'birthday_days':birthday_notice(data['now'])['days'],
+                'football_form_latest_first':(data.get('football') or {}).get('form') or [],
                 'dbs_next_kickoff_nl':(data.get('dbs',{}).get('fixture') or {}).get('date').isoformat() if (data.get('dbs',{}).get('fixture') or {}).get('date') else None,
                 'dbs_next_opponent':(data.get('dbs',{}).get('fixture') or {}).get('opponent'),
                 'dbs_schedule_source':data.get('dbs',{}).get('source'),
