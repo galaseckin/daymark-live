@@ -360,8 +360,11 @@ def weekend_football(now):
                     'fener': 'fenerbah' in (hn+' '+an).casefold(),
                     'state': state, 'state_label': match_state, 'score': result,
                     'id': identifier}
-    matches = list(matches_by_id.values())
-    big = ('liverpool', 'arsenal', 'manchester', 'chelsea', 'tottenham', 'bayern',
+today = now.astimezone(TZ).date()
+    matches = [
+        m for m in matches_by_id.values()
+        if m['date'].astimezone(TZ).date() == today
+    ]    big = ('liverpool', 'arsenal', 'manchester', 'chelsea', 'tottenham', 'bayern',
            'dortmund', 'barcelona', 'real madrid', 'atlético', 'atletico', 'newcastle')
     def priority(match):
         names = (match['home']+' '+match['away']).casefold()
