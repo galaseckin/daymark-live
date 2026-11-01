@@ -263,15 +263,14 @@ def football(now):
             'gs_logo':None,'date':when,'league':league,'home':home,
             'live':False,'source':'verified_schedule_cache_2026-10-30'})
 
-    # Prefer freshest match; if two sources say same opponent/day, use API.
-    # Cached fixtures only fill gaps; no events fabricated in live mode.
-    def normalize(opponent):
-        return ''.join(ch for ch in opponent.casefold() if ch.isalnum())
-    # Group by opponent and local calendar date. Prefer updated API kickoff
-    # over the cached kickoff even when a confirmed time has changed.
+    # ESPN and the confirmed cache can use different names for the same
+    # opponent (e.g. "Amed SFK" vs "Amedspor"). A club cannot normally play
+    # twice in the SAME league on the same local calendar day. Merge by
+    # competition + date instead of name; keep the live ESPN entry when both
+    # sources know that fixture. Keep distinct competitions separate.
     preferred={}
     for fixture in future:
-        key=(normalize(fixture['opponent']),fixture['date'].date())
+        key=(fixture['league'],fixture['date'].astimezone(TZ).date())
         older=preferred.get(key)
         if older is None or (fixture['source']=='espn_live_feed' and older['source']!='espn_live_feed'):
             preferred[key]=fixture
