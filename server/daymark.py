@@ -886,19 +886,21 @@ def render(data,cfg):
             league=league+'  ·  CACHE'
         t(704,yy+50,fit(league,11,269),11,'regular',GRAY)
     t(704,548,'CACHE = eerder bevestigde planning',10,'regular',GRAY)
-    # WEEKEND LOWER BAR: Galatasaray form / Super Lig Top 3 / next DBS O16-1.
+    # FOOTBALL LOWER BAR: form / standings / next DBS (weekends).
     panel(33,587,991,703)
     if now.weekday() in (5,6):
-        label(52,598,'WEEKEND  /  GS VORM · SÜPER LIG TOP 3 · DBS O16-1')
-        for sep in (356,668):rule(sep,633,sep,688)
+        # Three separate headings share the same y-position; no weekend prefix.
+        label(52,598,'GS VORM')
+        label(373,598,'SÜPER LIG TOP 3')
+        label(685,598,'OMER UTKU DBS')
+        for sep in (356,668):rule(sep,628,sep,688)
 
-        # Five compact monochrome circles; newest completed game at left.
-        # Display only verified outcomes. Empty circles mean "not available".
-        t(52,624,'GS VORM  ·  LAATSTE 5',13,'bold',GRAY)
-        form=(fb.get('form') or [])[:5]
-        for i in range(5):
-            result=form[i] if i < len(form) else None
-            cx,cy=74+i*55,664
+        # Oldest result on the left, newest completed result on the right.
+        # With fewer than five confirmed matches, empty slots stay on the LEFT.
+        form=(fb.get('form') or [])[:5]  # source is newest-first
+        form_slots=[None]*(5-len(form))+list(reversed(form))
+        for i,result in enumerate(form_slots):
+            cx,cy=74+i*55,659
             radius=18
             # Win: dark filled; loss: bright, double outline; draw: pale filled.
             fill = INK if result=='W' else PALE if result=='G' else WHITE
@@ -909,18 +911,17 @@ def render(data,cfg):
                           outline=MID,width=1)
             t(cx,cy,result if result else '·',17,'heavy',
               WHITE if result=='W' else INK,anchor='mm')
-        t(52,686,'NIEUWSTE LINKS  ·  W WINST / L VERLIES / G GELIJK',10,'regular',GRAY)
+        t(52,683,'NIEUWSTE RECHTS  ·  W/L/G',10,'regular',GRAY)
 
         teams=(data.get('standings') or {}).get('teams') or []
-        t(373,634,'TOP 3',12,'bold',GRAY)
         if teams:
             for i,team in enumerate(teams[:3]):
-                yy=651+i*16
-                name=fit(team['name'],12,193,'bold')
-                t(374,yy,f"{i+1}. {name}",12,'bold' if 'galatasaray' in team['name'].casefold() else 'regular')
-                t(651,yy,str(team['points'])+' PT',12,'bold',INK,anchor='ra')
+                yy=630+i*19
+                name=fit(team['name'],13,193,'bold')
+                t(374,yy,f"{i+1}. {name}",13,'bold' if 'galatasaray' in team['name'].casefold() else 'regular')
+                t(651,yy,str(team['points'])+' PT',13,'bold',INK,anchor='ra')
         else:
-            t(374,660,'Stand niet beschikbaar',14,'bold',GRAY)
+            t(374,645,'Stand niet beschikbaar',14,'bold',GRAY)
 
         entry=(data.get('dbs') or {}).get('fixture')
         if entry:
@@ -954,7 +955,7 @@ def render(data,cfg):
             t(left,676,sub,12,'bold',GRAY)
     # footer
     rule(33,718,991,718,INK,2)
-    t(34,730,'DAYMARK V3.8.6  •  PAPERWHITE 2  •  LANDSCAPE',12,'bold',GRAY)
+    t(34,730,'DAYMARK V3.8.7  •  PAPERWHITE 2  •  LANDSCAPE',12,'bold',GRAY)
     foot='DEMO • NIET LIVE' if data['demo'] else 'DATA KAN VERTRAAGD ZIJN • ONTBREKEND = —'
     t(991,731,foot,12,'bold',GRAY,anchor='ra')
     return im
