@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DAYMARK v3.9.1 AIRSPACE PRO + MEERHOVEN SKYLINE • live-rendered Kindle Paperwhite 2 landscape dashboard.
+"""DAYMARK v3.9.3 MET NORWAY + AIRSPACE PRO + MEERHOVEN SKYLINE • live-rendered Kindle Paperwhite 2 landscape dashboard.
 
 Generates both a 1024x758 design preview and a physically rotated
 758x1024 framebuffer image (so a portrait-orientation Kindle can be
@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 import dbs_auto
 import airspace
+import weather_metno
 
 BASE = pathlib.Path(__file__).resolve().parent
 W,H=1024,758
@@ -101,38 +102,8 @@ def weather_description(code, is_day=True):
     return 'Wisselvallig' if code is not None else 'Onbekend'
 
 
-def weather(cfg):
-    # Today + 3 calendar days ahead, in Eindhoven local time.
-    params={'latitude':cfg['weather_lat'],'longitude':cfg['weather_lon'],
-            'current':'temperature_2m,weather_code,apparent_temperature,wind_speed_10m,is_day',
-            'daily':'weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max',
-            'timezone':'Europe/Amsterdam','forecast_days':4}
-    obj=get_json('https://api.open-meteo.com/v1/forecast?'+urllib.parse.urlencode(params))
-    cur=obj.get('current') or {}; daily=obj.get('daily') or {}
-    code=cur.get('weather_code'); is_day=cur.get('is_day')==1
-    def at(key,index):
-        values=daily.get(key) or []
-        return values[index] if index < len(values) else None
-    future=[]
-    for index in range(1,4):
-        date_text=at('time',index)
-        try: date=dt.date.fromisoformat(date_text)
-        except (TypeError,ValueError): continue
-        dcode=at('weather_code',index)
-        future.append({'date':date, 'code':dcode,
-            'desc':weather_description(dcode),
-            'high':at('temperature_2m_max',index),
-            'low':at('temperature_2m_min',index),
-            'rain':at('precipitation_probability_max',index)})
-    # Current.time from Open-Meteo is already local due timezone param.
-    observed=cur.get('time')
-    try: observed_at=dt.datetime.fromisoformat(observed).replace(tzinfo=TZ)
-    except (ValueError,TypeError): observed_at=None
-    return {'temp':cur.get('temperature_2m'), 'feels':cur.get('apparent_temperature'),
-            'desc':weather_description(code,is_day), 'code':code,'is_day':is_day,
-            'observed_at':observed_at,'high':at('temperature_2m_max',0),
-            'low':at('temperature_2m_min',0),'rain':at('precipitation_probability_max',0),
-            'wind':cur.get('wind_speed_10m'),'forecast':future}
+# Weather fetching + cache protocol live in weather_metno.py.
+# Other data sources and the Kindle image/worker are unchanged.
 
 
 def gs_result_letter(score_text):
@@ -620,8 +591,14 @@ def live_data(cfg):
         except Exception as exc:
             errors.append(f'{name}: {type(exc).__name__}: {exc}')
             return default
+    # Primary weather source: official MET Norway Locationforecast.
+    # Cache is published on GitHub Pages so 30-minute Actions jobs respect
+    # MET Norway's >=3h non-Nordic request interval and Expires header.
+    prior=weather_metno.get_published_cache(now)
+    we, record, weather_error=weather_metno.resolve(cfg,now,prior)
+    if weather_error: errors.append('weer: '+weather_error)
     return {'now':now,'demo':False,
-            'weather':attempt('weer',lambda:weather(cfg),{}),
+            'weather':we, 'weather_cache_record':record,
             'football':attempt('voetbal',lambda:football(now),{}),
             'stocks':{},
             'gold':{},
@@ -816,30 +793,41 @@ def render(data,cfg):
     col_y1,col_y2=111,570
     xw=(33,345);xf=(356,674);xm=(685,991)
     for bounds in (xw,xf,xm):panel(bounds[0],col_y1,bounds[1],col_y2)
-    # WEATHER: current condition + the three upcoming days (no fabricated forecast)
+    # WEATHER: MET Norway model forecast + three days. No dummy values live.
     x=51
     label(x,133,'WEER  /  '+str(cfg['city']).upper())
     temp=we.get('temp')
-    t(x,167,f'{num(temp)}°',91,'heavy')
-    weather_icon(279,207,we.get('code'),we.get('is_day',True),1.13)
-    t(x,272,fit(we.get('desc') or 'Geen weergegevens',23,277,'bold'),23,'bold',INK)
-    t(x,308,f"MAX {num(we.get('high'))}°   MIN {num(we.get('low'))}°   REGEN {num(we.get('rain'))}%",14,'bold',GRAY)
-    rule(51,339,326,339)
-    label(x,354,'KOMENDE 3 DAGEN')
-    future=we.get('forecast') or []
-    for i in range(3):
-        yy=390+i*49
-        if i>0: rule(51,yy-9,325,yy-9,BORDER,1)
-        item=future[i] if i<len(future) else {}
-        day=item.get('date')
-        day_label=f'{DAYS[day.weekday()][:2].upper()} {day.day}' if isinstance(day,dt.date) else '—'
-        t(52,yy,day_label,18,'bold')
-        weather_icon(157,yy+10,item.get('code'),True,0.42)
-        t(251,yy,f"{num(item.get('high'))}°/{num(item.get('low'))}°",19,'bold',anchor='ra')
-        t(326,yy+4,f"{num(item.get('rain'))}%",15,'bold',GRAY,anchor='ra')
-    obs=we.get('observed_at')
-    stamp=f'WEERUPDATE {obs:%H:%M}' if isinstance(obs,dt.datetime) else 'WEERBRON OPEN-METEO'
-    t(51,545,stamp,11,'regular',GRAY)
+    if not isinstance(temp,(int,float)):
+        t(64,220,'WEER TIJDELIJK',25,'bold',INK)
+        t(64,255,'NIET BESCHIKBAAR',25,'bold',INK)
+        rule(51,339,326,339)
+        t(64,365,'Geen betrouwbare voorspelling.',15,'regular',GRAY)
+        t(64,398,'Volgende update probeert opnieuw.',14,'regular',GRAY)
+        t(51,545,'MET NORWAY · GEEN DATA',11,'regular',GRAY)
+    else:
+        t(x,167,f'{num(temp)}°',91,'heavy')
+        weather_icon(279,207,we.get('code'),we.get('is_day',True),1.13)
+        t(x,272,fit(we.get('desc') or 'Weer onbekend',23,277,'bold'),23,'bold',INK)
+        t(x,308,f"MAX {num(we.get('high'))}°   MIN {num(we.get('low'))}°   REGEN {num(we.get('rain'))}%",14,'bold',GRAY)
+        rule(51,339,326,339)
+        label(x,354,'KOMENDE 3 DAGEN')
+        future=we.get('forecast') or []
+        for i in range(3):
+            yy=390+i*49
+            if i>0: rule(51,yy-9,325,yy-9,BORDER,1)
+            item=future[i] if i<len(future) else {}
+            day=item.get('date')
+            day_label=f'{DAYS[day.weekday()][:2].upper()} {day.day}' if isinstance(day,dt.date) else '—'
+            t(52,yy,day_label,18,'bold')
+            weather_icon(157,yy+10,item.get('code'),True,0.42)
+            t(251,yy,f"{num(item.get('high'))}°/{num(item.get('low'))}°",19,'bold',anchor='ra')
+            t(326,yy+4,f"{num(item.get('rain'))}%",15,'bold',GRAY,anchor='ra')
+        if we.get('source')=='cached':
+            age=we.get('cache_age_minutes')
+            stamp=f'MET NORWAY · OUD ({round(age/60)} U)' if isinstance(age,(int,float)) else 'MET NORWAY · OUD'
+        else:
+            stamp='WEERBRON MET NORWAY · MODEL'
+        t(51,545,stamp,11,'regular',GRAY)
     # FOOTBALL: club crest + opponent crest on BOTH fixtures
     x=374
     label(x,133,'GALATASARAY  /  FOOTBALL')
@@ -994,6 +982,9 @@ def main():
         shutil.copy2(right,dest/'daymark.png')
         if (BASE/'ATTRIBUTION.md').exists():
             shutil.copy2(BASE/'ATTRIBUTION.md',dest/'ATTRIBUTION.md')
+        if not data['demo'] and data.get('weather_cache_record'):
+            (dest/'weather_cache.json').write_text(json.dumps(data['weather_cache_record'],
+                ensure_ascii=False, separators=(',',':'))+'\n', encoding='utf-8')
         status={'generated_at':dt.datetime.now(dt.timezone.utc).isoformat(),
                 'mode':'demo' if args.demo else 'live',
                 'sources_missing':data.get('errors',[]),
@@ -1003,6 +994,8 @@ def main():
                 'airspace_error':(data.get('airspace') or {}).get('error'),
                 'airspace_snapshot_utc':(data.get('airspace') or {}).get('observed_at_utc').isoformat() if isinstance((data.get('airspace') or {}).get('observed_at_utc'),dt.datetime) else None,
                 'airspace_enrichment_enabled':os.environ.get('DAYMARK_AIRSPACE_ENRICH')=='1',
+                'weather_source':data.get('weather',{}).get('source') or 'unavailable',
+                'weather_cache_age_minutes':data.get('weather',{}).get('cache_age_minutes'),
                 'weather_temperature':data.get('weather',{}).get('temp'),
                 'weather_description':data.get('weather',{}).get('desc'),
                 'weather_is_day':data.get('weather',{}).get('is_day'),
