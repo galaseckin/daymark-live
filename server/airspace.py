@@ -1,236 +1,365 @@
-"""DAYMARK AIRSPACE: optional, read-only aviation snapshot for Meerhoven.
+"""DAYMARK AIRSPACE 2.0: compact aircraft count + two rotating flight cards.
 
-Only public neighborhood coordinates are used. No home address or personal
-identifier is sent to OpenSky. All network I/O runs on the server, never Kindle.
+Drop-in replacement for server/airspace.py; weather, skyline, football and Kindle
+worker are not modified. Data sources:
+  - adsb.fi: near-aircraft positions, type codes, community military flag
+    (personal, non-commercial; attribution must remain visible).
+  - OpenSky: fallback if adsb.fi is unavailable.
+  - adsb.lol: optional crowd-sourced *route indication* for featured flights;
+    never displayed as verified flight itinerary.
 
-The lower bar draws on the caller's existing Pillow image at 1024x758.
+Only public Meerhoven *neighborhood* coordinates are transmitted. Flight data is
+not used to make assertions of actual passengers aboard an aircraft.
 """
 from __future__ import annotations
+
 import datetime as dt
 import json
 import math
 import os
+import re
 import urllib.parse
 import urllib.request
 
-# Public *neighborhood* point in Meerhoven, NOT a private address.
-CENTER_LAT = 51.44148
+CENTER_LAT = 51.44148   # neighborhood centre, NOT an exact residential address
 CENTER_LON = 5.40563
 RADIUS_KM = 30.0
+RADIUS_NM = 17              # provider's radius is in nautical miles (~31.5 km)
+
+# Airline prefixes are a *heuristic* for regularly operated airline flights,
+# NOT evidence that passengers are aboard a particular aircraft.
+PASSENGER_OPERATORS = frozenset(
+    'RYR KLM TRA TFL TUI EZY EJU EWG DLH BAW BEL AUA SAS THY WZZ WUK '
+    'VLG SWR TVF UAE QTR NAX FIN LOT TAP IBE ITY AFR DAL UAL AAL EIN '
+    'PGT CFG TSC NEO EXS VIR KAL AEE AIC SIA CPA ETH RAM AEA'.split()
+)
+CARGO_OPERATORS = frozenset(
+    'FDX UPS BCS DHK CLX GTI ABX BOX CKS SRR MPH TAY NPT CWC ASL'.split()
+)
 
 
-def _finite(x):
+def _finite(value):
     try:
-        f = float(x)
-        return f if math.isfinite(f) else None
+        number = float(value)
+        return number if math.isfinite(number) else None
     except (TypeError, ValueError, OverflowError):
         return None
 
 
 def haversine_km(lat1, lon1, lat2, lon2):
-    rlat1, rlat2 = math.radians(lat1), math.radians(lat2)
-    dr = rlat2-rlat1
-    dl = math.radians(lon2-lon1)
-    a = math.sin(dr/2)**2 + math.cos(rlat1)*math.cos(rlat2)*math.sin(dl/2)**2
-    return 6371.0088 * 2 * math.asin(min(1.0, math.sqrt(max(0.0,a))))
+    a1, a2 = math.radians(lat1), math.radians(lat2)
+    da, dl = a2-a1, math.radians(lon2-lon1)
+    h = math.sin(da/2)**2 + math.cos(a1)*math.cos(a2)*math.sin(dl/2)**2
+    return 12742.0176 * math.asin(min(1.0, math.sqrt(max(0.0,h))))
 
 
-def _get_json(url, timeout=8):
-    req=urllib.request.Request(url,headers={'Accept':'application/json','User-Agent':'DAYMARK-Airspace/1.0 personal dashboard'})
-    with urllib.request.urlopen(req,timeout=timeout) as response:
-        raw=response.read(3_000_001)
-    if len(raw)>3_000_000: raise ValueError('API-antwoord te groot')
+def _get_json(url, *, timeout=7):
+    req = urllib.request.Request(url, headers={
+        'Accept':'application/json', 'User-Agent':'DAYMARK-Airspace/2.0 personal e-ink dashboard'})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read(2_500_001)
+    if len(raw)>2_500_000: raise ValueError('Antwoord te groot')
     return json.loads(raw)
 
 
-def _enrich_adsbdb(item):
-    """Optional enrichment; OFF by default due to route redistribution uncertainty.
+def _post_json(url, payload, *, timeout=5):
+    req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'),
+        headers={'Accept':'application/json', 'Content-Type':'application/json',
+                 'User-Agent':'DAYMARK-Airspace/2.0 personal e-ink dashboard'}, method='POST')
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read(250_001)
+    if len(raw)>250_000: raise ValueError('Routeantwoord te groot')
+    return json.loads(raw)
 
-    Only enable when you have established that the data usage rights permit
-    publishing the resulting public image. Never persist a route database.
-    """
-    if os.getenv('DAYMARK_AIRSPACE_ENRICH','0')!='1': return
-    icao=item.get('icao24') or ''
-    if len(icao)!=6 or any(c not in '0123456789abcdef' for c in icao): return
-    cs=''.join(c for c in item.get('callsign','') if c.isalnum()).upper()
-    url='https://api.adsbdb.com/v0/aircraft/'+icao
-    if cs: url+='?'+urllib.parse.urlencode({'callsign':cs})
-    try:
-        data=_get_json(url,timeout=4).get('response')
-        if not isinstance(data,dict): return
-        a=data.get('aircraft') or {}
-        if isinstance(a,dict):
-            item['type']=str(a.get('icao_type') or '')[:8]
-        fl=data.get('flightroute') or {}
-        if isinstance(fl,dict):
-            origin=fl.get('origin') or {}; destination=fl.get('destination') or {}
-            if isinstance(origin,dict) and isinstance(destination,dict):
-                a=str(origin.get('iata_code') or origin.get('icao_code') or '').upper()
-                b=str(destination.get('iata_code') or destination.get('icao_code') or '').upper()
-                if 3<=len(a)<=4 and 3<=len(b)<=4 and a.isalnum() and b.isalnum():
-                    item['route']=a+' → '+b
-    except Exception:
-        return
+
+def _sanitize_token(value, maxlen=12):
+    return re.sub(r'[^A-Z0-9-]', '', str(value or '').upper().strip())[:maxlen]
+
+
+def _classify(callsign, typ, *, military=False):
+    """Do not claim the aircraft is transporting passengers unless that is known."""
+    if military: return 'MILITAIR'
+    prefix = _sanitize_token(callsign)[:3]
+    if prefix in CARGO_OPERATORS: return 'CARGO'
+    # Known airline prefix; label carefully as an *airline flight*, not a
+    # verified passenger manifest or guaranteed passenger-carrying operation.
+    if prefix in PASSENGER_OPERATORS:
+        return 'LIJNVLUCHT'
+    return 'OVERIG'
+
+
+def _item(icao, callsign, typ, lat, lon, alt_ft, speed_kt, track, category, age):
+    return {'icao24':_sanitize_token(icao,8).lower(),
+            'callsign':_sanitize_token(callsign,12) or _sanitize_token(icao,8) or 'ONBEKEND',
+            'type':_sanitize_token(typ,9), 'route':'', 'route_kind':'',
+            'lat':lat, 'lon':lon, 'distance_km':round(haversine_km(CENTER_LAT,CENTER_LON,lat,lon),1),
+            'alt_ft':round(alt_ft) if alt_ft is not None else None,
+            'speed_kt':round(speed_kt) if speed_kt is not None else None,
+            'track':(track%360) if track is not None else None,
+            'category':category, 'position_age_s':round(max(0,age))}
+
+
+def _stamp(timestamp, now):
+    sec = _finite(timestamp)
+    if sec is None: return now
+    if sec>1e11: sec/=1000  # ADS-B Exchange-style now is milliseconds
+    if abs(now.timestamp()-sec)>300: raise ValueError('Verouderde ADS-B snapshot')
+    return dt.datetime.fromtimestamp(sec, dt.timezone.utc)
+
+
+def parse_adsbfi(payload, *, now_utc=None):
+    now_utc=now_utc or dt.datetime.now(dt.timezone.utc)
+    if not isinstance(payload,dict) or not isinstance(payload.get('ac'),list):
+        raise ValueError('ADSB.fi antwoord zonder ac-lijst')
+    when=_stamp(payload.get('now'),now_utc)
+    flights=[]
+    for row in payload['ac']:
+        if not isinstance(row,dict): continue
+        lat=_finite(row.get('lat')); lon=_finite(row.get('lon'))
+        if lat is None or lon is None or not (-90<=lat<=90 and -180<=lon<=180): continue
+        if haversine_km(CENTER_LAT,CENTER_LON,lat,lon)>RADIUS_KM: continue
+        alt_raw=row.get('alt_baro')
+        if alt_raw=='ground' or alt_raw=='GROUND': continue
+        age=_finite(row.get('seen_pos'))
+        if age is None: age=_finite(row.get('seen'))
+        if age is None or age>180 or age<0: continue
+        # The ADS-B dbFlags military bit is database classification, not an
+        # inference based on callsign/nationality.
+        try: flags=int(row.get('dbFlags') or 0)
+        except (TypeError,ValueError): flags=0
+        typ=_sanitize_token(row.get('t'),9)
+        callsign=_sanitize_token(row.get('flight'),12)
+        category=_classify(callsign,typ,military=bool(flags&1))
+        altitude=_finite(alt_raw)
+        if altitude is None: altitude=_finite(row.get('alt_geom'))
+        flight=_item(row.get('hex'),callsign,typ,lat,lon,altitude,
+                     _finite(row.get('gs')),_finite(row.get('track')),category,age)
+        flights.append(flight)
+    flights.sort(key=lambda a:(a['distance_km'],a['callsign']))
+    return {'status':'ok','source':'adsb.fi','flights':flights,'count':len(flights),
+            'observed_at_utc':when,'error':None}
 
 
 def parse_snapshot(payload, *, now_utc=None, radius_km=RADIUS_KM):
-    """Parse and validate state vectors, rejecting stale or implausible positions."""
+    """OpenSky fallback; cannot reliably identify flight category/type/routes."""
     now_utc=now_utc or dt.datetime.now(dt.timezone.utc)
-    now_ts=now_utc.timestamp()
     if not isinstance(payload,dict) or not isinstance(payload.get('states'),list):
         raise ValueError('OpenSky antwoord zonder states')
-    source_ts=_finite(payload.get('time'))
-    if source_ts is None or abs(now_ts-source_ts)>300:
-        raise ValueError('Verouderde OpenSky-snapshot')
+    when=_stamp(payload.get('time'),now_utc)
     result=[]
     for row in payload['states']:
         if not isinstance(row,list) or len(row)<11: continue
-        # Fields documented by OpenSky: 3=time_position, 5=lon, 6=lat,
-        # 7=baro_alt, 8=on_ground, 9=velocity, 10=true_track.
-        pos_ts=_finite(row[3]); lat=_finite(row[6]); lon=_finite(row[5]);
-        if pos_ts is None or lat is None or lon is None: continue
-        if not -90<=lat<=90 or not -180<=lon<=180: continue
-        if row[8] is True or abs(now_ts-pos_ts)>180: continue
-        distance=haversine_km(CENTER_LAT,CENTER_LON,lat,lon)
-        if distance>radius_km: continue
-        icao=str(row[0] or '').strip().lower()
-        callsign=str(row[1] or '').strip().upper()[:10]
-        alt_m=_finite(row[7]); alt_ft=round(alt_m*3.28084) if alt_m is not None else None
-        speed_ms=_finite(row[9]); speed_kt=round(speed_ms*1.94384) if speed_ms is not None and speed_ms>=0 else None
-        track=_finite(row[10]); track=track%360 if track is not None else None
-        result.append({'icao24':icao,'callsign':callsign or icao.upper() or 'ONBEKEND',
-          'lat':lat,'lon':lon,'distance_km':round(distance,1),
-          'alt_ft':alt_ft,'speed_kt':speed_kt,'track':track,'type':'','route':'',
-          'position_age_s':max(0,int(now_ts-pos_ts))})
+        ts=_finite(row[3]); lon=_finite(row[5]); lat=_finite(row[6])
+        if ts is None or lat is None or lon is None: continue
+        if abs(now_utc.timestamp()-ts)>180: continue
+        if not (-90<=lat<=90 and -180<=lon<=180) or row[8] is True: continue
+        if haversine_km(CENTER_LAT,CENTER_LON,lat,lon)>radius_km: continue
+        alt=_finite(row[7]); speed=_finite(row[9])
+        result.append(_item(row[0],row[1],'',lat,lon,alt*3.28084 if alt is not None else None,
+                            speed*1.94384 if speed is not None else None,
+                            _finite(row[10]),'OVERIG',max(0,now_utc.timestamp()-ts)))
     result.sort(key=lambda a:(a['distance_km'],a['callsign']))
-    return {'status':'ok','source':'OpenSky','flights':result,
-            'count':len(result),'observed_at_utc':dt.datetime.fromtimestamp(source_ts,dt.timezone.utc),
-            'error':None}
+    return {'status':'ok','source':'OpenSky fallback','flights':result,
+            'count':len(result),'observed_at_utc':when,'error':None}
+
+
+def _rotation_slot(now_utc):
+    """Github run number changes per run. Local fallback changes each 30 min."""
+    run = os.environ.get('GITHUB_RUN_NUMBER','')
+    if run.isdigit(): return int(run)
+    return int(now_utc.timestamp()//1800)
+
+
+def pick_featured(flights, slot):
+    """Prefer a changing commercial-airline flight and an unusual second plane.
+
+    When there are multiple suitable airline flights, the selected index changes
+    with the monotonically increasing GitHub run number (stable input pool).
+    """
+    if not flights: return []
+    airline=sorted((x for x in flights if x.get('category')=='LIJNVLUCHT'),
+                   key=lambda x:(x['callsign'],x.get('icao24','')))
+    if airline: first=airline[slot%len(airline)]
+    else:
+        civil=sorted((x for x in flights if x.get('category')!='MILITAIR'),
+                     key=lambda x:(x.get('distance_km',999),x['callsign']))
+        first=(civil or flights)[slot%len(civil or flights)]
+    remaining=[a for a in flights if a is not first]
+    unusual=[a for a in remaining if a.get('category') in ('MILITAIR','CARGO')]
+    if unusual:
+        unusual.sort(key=lambda a: (0 if a['category']=='MILITAIR' else 1,a.get('distance_km',999)))
+        second=unusual[0]
+    else:
+        # If no special aircraft, show a different airliner if available.
+        secondary_airline=sorted((a for a in remaining if a.get('category')=='LIJNVLUCHT'),
+                                 key=lambda x:(x['callsign'],x.get('icao24','')))
+        other=secondary_airline or sorted(remaining,key=lambda a:a.get('distance_km',999))
+        second=other[(slot//max(1,len(airline)))%len(other)] if other else None
+    return [first]+([second] if second else [])
+
+
+def parse_routeset(payload, requested_callsigns):
+    """Only accepts single unequivocal 2-airport indicative routes."""
+    found={}
+    if not isinstance(payload,list): return found
+    allowed=set(requested_callsigns)
+    for entry in payload:
+        if not isinstance(entry,dict): continue
+        cs=_sanitize_token(entry.get('callsign'),12)
+        if cs not in allowed: continue
+        code=str(entry.get('_airport_codes_iata') or '').strip().upper()
+        # Some responses have ICAO codes only; prefer 3-char IATA for compact UI
+        bits=code.split('-')
+        if len(bits)!=2 or any(not re.fullmatch(r'[A-Z]{3}',b) for b in bits): continue
+        # Crowdsourced route hints can be approximate; mark every route as such.
+        if bits[0]==bits[1]: continue
+        found[cs]=' → '.join(bits)
+    return found
+
+
+def enrich_featured_routes(featured):
+    """One bounded extra request. Failures never affect the main flight list.
+
+    Only routes with an unambiguous IATA pair are shown, always *indicative*.
+    """
+    candidates=[a for a in featured if _sanitize_token(a.get('callsign')) and a.get('lat') is not None]
+    if not candidates: return
+    planes=[{'callsign':a['callsign'],'lat':a['lat'],'lng':a['lon']} for a in candidates]
+    try:
+        routes=parse_routeset(_post_json('https://api.adsb.lol/api/0/routeset',{'planes':planes}),
+                              [a['callsign'] for a in candidates])
+        for a in candidates:
+            if a['callsign'] in routes:
+                a['route']=routes[a['callsign']]
+                a['route_kind']='indicatie'
+    except Exception:
+        pass
 
 
 def fetch(now_utc=None):
-    """Fetch one rate-limited public snapshot. Fail safe: never invent traffic."""
     now_utc=now_utc or dt.datetime.now(dt.timezone.utc)
-    lat_delta=RADIUS_KM/110.574
-    lon_delta=RADIUS_KM/(111.320*math.cos(math.radians(CENTER_LAT)))
-    params={'lamin':round(CENTER_LAT-lat_delta,5),'lamax':round(CENTER_LAT+lat_delta,5),
-            'lomin':round(CENTER_LON-lon_delta,5),'lomax':round(CENTER_LON+lon_delta,5)}
-    url='https://opensky-network.org/api/states/all?'+urllib.parse.urlencode(params)
     try:
-        result=parse_snapshot(_get_json(url),now_utc=now_utc)
-        for item in result['flights'][:3]: _enrich_adsbdb(item)
-        return result
-    except Exception as exc:
-        return {'status':'error','source':'OpenSky','flights':[], 'count':None,
-                'observed_at_utc':None,'error':type(exc).__name__+': '+str(exc)[:160]}
+        # Original provider uses nautical miles. Server-side filtering is 30 km.
+        url=(f'https://opendata.adsb.fi/api/v3/lat/{CENTER_LAT:.5f}'
+             f'/lon/{CENTER_LON:.5f}/dist/{RADIUS_NM}')
+        result=parse_adsbfi(_get_json(url),now_utc=now_utc)
+    except Exception as primary_error:
+        lat_delta=RADIUS_KM/110.574
+        lon_delta=RADIUS_KM/(111.320*math.cos(math.radians(CENTER_LAT)))
+        query=urllib.parse.urlencode({'lamin':round(CENTER_LAT-lat_delta,5),
+                                     'lamax':round(CENTER_LAT+lat_delta,5),
+                                     'lomin':round(CENTER_LON-lon_delta,5),
+                                     'lomax':round(CENTER_LON+lon_delta,5)})
+        try:
+            result=parse_snapshot(_get_json('https://opensky-network.org/api/states/all?'+query),now_utc=now_utc)
+        except Exception as fallback_error:
+            return {'status':'error','source':'adsb.fi / OpenSky','flights':[],
+                    'featured':[],'count':None,'observed_at_utc':None,
+                    'error':f'{type(primary_error).__name__} / {type(fallback_error).__name__}'}
+    slot=_rotation_slot(now_utc)
+    result['featured']=pick_featured(result['flights'],slot)
+    result['rotation_slot']=slot
+    # No third-party route lookup if there are no eligible planes or no route.
+    if result['featured']:
+        enrich_featured_routes(result['featured'])
+    return result
 
 
 def demo(now):
-    """Only used by explicit --demo; no fabricated records in live mode."""
-    positions=[
-      (51.493,5.498,'DEMO101','B738','EIN → PMI',8700,145,285),
-      (51.345,5.290,'DEMO202','A320','AMS → BCN',16800,222,330),
-      (51.522,5.204,'DEMO303','E190','EIN → LHR',11200,180,95),
+    """Explicit --demo only; no fabricated values in normal fetch()."""
+    now_utc=now.astimezone(dt.timezone.utc)
+    fixtures=[
+        (51.490,5.489,'RYR1234','B738',7400,232,230,'LIJNVLUCHT','EIN → PMI'),
+        (51.371,5.326,'TUI834','B38M',9400,260,160,'LIJNVLUCHT','EIN → ALC'),
+        (51.520,5.520,'KLM992','E190',11000,280,290,'LIJNVLUCHT','AMS → BRU'),
+        (51.490,5.220,'NAF21','C130',2800,158,95,'MILITAIR',''),
+        (51.319,5.399,'BCS6','B752',11500,290,140,'CARGO',''),
     ]
     flights=[]
-    for lat,lon,cs,typ,route,alt,speed,track in positions:
-        flights.append({'icao24':'000000','callsign':cs,'type':typ,'route':route,
-          'lat':lat,'lon':lon,'distance_km':round(haversine_km(CENTER_LAT,CENTER_LON,lat,lon),1),
-          'alt_ft':alt,'speed_kt':speed,'track':track,'position_age_s':3})
-    flights.sort(key=lambda x:x['distance_km'])
-    return {'status':'demo','source':'DEMO','flights':flights,'count':len(flights),
-      'observed_at_utc':now.astimezone(dt.timezone.utc),'error':None}
+    for lat,lon,cs,typ,alt,spd,track,cat,route in fixtures:
+        a=_item('ab1234',cs,typ,lat,lon,alt,spd,track,cat,8)
+        a['route']=route; a['route_kind']='indicatie' if route else ''
+        flights.append(a)
+    flights.sort(key=lambda a:a['distance_km'])
+    slot=_rotation_slot(now_utc)
+    return {'status':'demo','source':'DEMO','flights':flights,'featured':pick_featured(flights,slot),
+            'count':len(flights),'rotation_slot':slot,'observed_at_utc':now_utc,'error':None}
 
 
-def render_bar(im, d, data, *, font, color_ink=31, color_gray=95, color_border=207,
-               pale=246, white=255, local_tz=None):
-    """Draw the real available bottom band (x33–991, y587–703)."""
-    t=lambda x,y,s,size=12,kind='regular',fill=color_ink,anchor=None: d.text((x,y),str(s),font=font(size,kind),fill=fill,anchor=anchor)
+def render_bar(im,d,data,*,font,color_ink=31,color_gray=95,color_border=207,
+               pale=246,white=255,local_tz=None):
+    """Render 958×116 lower panel in existing DAYMARK geometry."""
+    def t(x,y,txt,size=12,kind='regular',fill=color_ink,anchor=None):
+        d.text((x,y),str(txt),font=font(size,kind),fill=fill,anchor=anchor)
+    def fitted(txt,size,maxw,minsize=10):
+        txt=str(txt)
+        while size>minsize and d.textbbox((0,0),txt,font=font(size,'bold'))[2]>maxw:
+            size-=1
+        if d.textbbox((0,0),txt,font=font(size,'bold'))[2]<=maxw: return txt,size
+        while txt and d.textbbox((0,0),txt+'…',font=font(size,'bold'))[2]>maxw:
+            txt=txt[:-1]
+        return txt+'…',size
     d.rounded_rectangle((33,587,991,703),radius=15,fill=white,outline=color_border,width=2)
-    d.line((214,600,214,690),fill=color_border,width=1)
-    d.line((455,600,455,690),fill=color_border,width=1)
-    # Left area: oversized count with accurate failure vs zero distinction.
-    t(52,599,'AIRSPACE',15,'bold',color_gray)
-    state=data.get('status')
-    count=data.get('count')
+    # 3 columns: 166 px counter, 387 px flight card, 385 px special card.
+    d.line((205,600,205,691),fill=color_border,width=1)
+    d.line((598,600,598,691),fill=color_border,width=1)
+    t(51,598,'AIRSPACE',15,'bold',color_gray)
+    state=data.get('status'); count=data.get('count')
     if state=='error':
-        t(52,624,'—',43,'heavy')
-        t(52,674,'BRON OFFLINE',11,'bold',color_gray)
+        t(52,621,'—',40,'heavy')
+        t(51,671,'BRON OFFLINE',10,'bold',color_gray)
     else:
-        t(52,619,str(count if count is not None else '—'),47,'heavy')
-        t(52,675,'BINNEN 30 KM',11,'bold',color_gray)
-    t(52,691,'MEERHOVEN',10,'bold',color_gray)
-    # Radar radius constrained by the actual y587..703 band.
-    cx,cy=334,647
-    for r in (23,46):
-        d.ellipse((cx-r,cy-r,cx+r,cy+r),outline=color_border,width=1)
-    d.line((cx-49,cy,cx+49,cy),fill=207,width=1)
-    d.line((cx,cy-49,cx,cy+49),fill=207,width=1)
-    d.ellipse((cx-3,cy-3,cx+3,cy+3),fill=color_ink)
-    t(cx+4,594,'N',9,'bold',color_gray,anchor='mm')
-    flights=data.get('flights') or []
-    for i,a in enumerate(flights[:8]):
-        lat=_finite(a.get('lat')); lon=_finite(a.get('lon'))
-        if lat is None or lon is None: continue
-        east=(lon-CENTER_LON)*111.320*math.cos(math.radians(CENTER_LAT))
-        north=(lat-CENTER_LAT)*110.574
-        x=cx+east/RADIUS_KM*46
-        y=cy-north/RADIUS_KM*46
-        # Restrict marker fully to radar circle.
-        dx,dy=x-cx,y-cy
-        dist=math.hypot(dx,dy)
-        if dist>43:
-            x=cx+dx/dist*43; y=cy+dy/dist*43
-        track=_finite(a.get('track'))
-        if track is not None:
-            # Tiny arrow rotated to actual course (north = top).
-            angle=math.radians(track)
-            fx,fy=math.sin(angle),-math.cos(angle)
-            sx,sy=-fy,fx
-            tip=(x+fx*7,y+fy*7)
-            l=(x-fx*4+sx*3,y-fy*4+sy*3)
-            r=(x-fx*4-sx*3,y-fy*4-sy*3)
-            d.polygon([tip,l,r],fill=color_ink)
+        t(52,617,f'{count:02d}' if isinstance(count,int) and count<100 else str(count if count is not None else '—'),
+          43,'heavy')
+        t(52,669,'VLIEGTUIGEN',11,'bold')
+    t(52,686,'BINNEN 30 KM',10,'regular',color_gray)
+
+    featured=data.get('featured')
+    if featured is None:
+        featured=pick_featured(data.get('flights') or [],_rotation_slot(dt.datetime.now(dt.timezone.utc)))
+    # main flight cards; visible route is always an indication, never guaranteed.
+    columns=((223,579,1),(615,971,2))
+    for i,(x,maxx,num) in enumerate(columns):
+        if state=='error':
+            if i==0:
+                t(x,612,'GEEN ACTUELE DATA',17,'heavy')
+                t(x,647,'Vliegtuigbron niet bereikbaar',14,'regular',color_gray)
+            else:
+                t(x,618,'GEEN VLIEGGEGEVENS',15,'bold')
+            continue
+        if i>=len(featured):
+            if i==0:
+                t(x,616,'LUCHTRUIM RUSTIG',17,'heavy')
+                t(x,646,'Geen vliegtuig binnen 30 km',13,'regular',color_gray)
+            else:
+                t(x,623,'GEEN TWEEDE VLIEGTUIG',14,'bold',color_gray)
+            continue
+        a=featured[i]
+        category=a.get('category') or 'OVERIG'
+        category_label={'LIJNVLUCHT':'LIJNVLUCHT*','CARGO':'CARGO*',
+                        'MILITAIR':'MILITAIR','OVERIG':'VLIEGTUIG'}.get(category,'VLIEGTUIG')
+        t(x,597,'01  ·  '+category_label if i==0 else '02  ·  '+category_label,11,'bold',color_gray)
+        callsign=_sanitize_token(a.get('callsign')) or 'ONBEKEND'
+        callsign,sz=fitted(callsign,21,170,15)
+        t(x,614,callsign,sz,'bold')
+        kind=a.get('route_kind')
+        route=a.get('route') if kind=='indicatie' else ''
+        if route:
+            route,rsz=fitted(route,22,maxx-(x+180),14)
+            t(x+182,614,route,rsz,'bold')
+            t(x+182,640,'ROUTE-INDICATIE',9,'regular',color_gray)
         else:
-            d.ellipse((x-3,y-3,x+3,y+3),fill=color_ink)
-        if i<3:
-            tx=x+9 if x<cx+28 else x-9
-            ty=y-10 if y>cy-29 else y+9
-            t(tx,ty,str(i+1),9,'heavy',color_ink,'lm' if tx>x else 'rm')
-    # Right: 3 columns, not 3 stacked rows (too little vertical space).
-    for x in (637,809): d.line((x,600,x,690),fill=color_border,width=1)
-    if state=='error':
-        t(478,618,'GEEN ACTUELE RADARGEGEVENS',17,'bold')
-        t(478,651,'OpenSky tijdelijk niet bereikbaar',13,'regular',color_gray)
-    elif not flights:
-        t(478,618,'GEEN VLIEGTUIGEN GEDETECTEERD',16,'bold')
-        t(478,651,'Binnen 30 km · posities van deze meting',12,'regular',color_gray)
-    else:
-        for i,a in enumerate(flights[:3]):
-            x=(474,648,819)[i]
-            maxw=(152,150,151)[i]
-            t(x,599,f'{i+1:02d}  ·  VLIEGTUIG',10,'bold',color_gray)
-            cs=(a.get('callsign') or 'ONBEKEND')[:11]
-            t(x,615,cs,16 if len(cs)<=8 else 14,'heavy')
-            route=(a.get('route') or '')
-            typ=(a.get('type') or '')
-            course=_finite(a.get('track'))
-            desc=(typ+' · '+route) if typ and route else (route or typ or
-                    (f'KOERS {course:.0f}°' if course is not None else 'TYPE ONBEKEND'))
-            while desc and d.textbbox((0,0),desc,font=font(12,'bold'))[2]>156:
-                desc=desc[:-2]+'…'
-            t(x,642,desc,12,'bold',color_ink)
-            alt=a.get('alt_ft')
-            t(x,663, (f'{alt:,} FT'.replace(',','.') if isinstance(alt,int) else 'HOOGTE —'),14,'bold')
-            dist=a.get('distance_km')
-            speed=a.get('speed_kt')
-            sub=(f'{dist:.1f} KM' if isinstance(dist,(float,int)) else '— KM')
-            if isinstance(speed,int): sub+=f'  ·  {speed} KT'
-            t(x,686,sub[:24],11,'regular',color_gray)
+            t(x+182,620,'ROUTE ONBEKEND',12,'regular',color_gray)
+        typ=_sanitize_token(a.get('type')) or 'TYPE ONBEKEND'
+        t(x,646,'TOESTEL  '+typ,13,'bold')
+        dist=a.get('distance_km'); alt=a.get('alt_ft'); spd=a.get('speed_kt')
+        dist_txt=f'{dist:.1f} KM' if isinstance(dist,(int,float)) else '— KM'
+        alt_txt=f'{alt:,} FT'.replace(',','.') if isinstance(alt,int) else '— FT'
+        spd_txt=f'{spd} KT' if isinstance(spd,int) else '— KT'
+        t(x,670,dist_txt+'   ·   '+alt_txt+'   ·   '+spd_txt,12,'regular',color_ink)
     obs=data.get('observed_at_utc')
     if isinstance(obs,dt.datetime):
         if local_tz: obs=obs.astimezone(local_tz)
         stamp=f'SNAPSHOT {obs:%H:%M}'
     else: stamp='GEEN ACTUELE METING'
-    # Subtitle in external footer rather than inside the cramped strip.
     return stamp
