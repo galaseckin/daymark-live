@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DAYMARK v3.8.6 • live-rendered Kindle Paperwhite 2 landscape dashboard.
+"""DAYMARK v3.9.1 AIRSPACE PRO + MEERHOVEN SKYLINE • live-rendered Kindle Paperwhite 2 landscape dashboard.
 
 Generates both a 1024x758 design preview and a physically rotated
 758x1024 framebuffer image (so a portrait-orientation Kindle can be
@@ -26,6 +26,7 @@ import urllib.request
 from zoneinfo import ZoneInfo
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 import dbs_auto
+import airspace
 
 BASE = pathlib.Path(__file__).resolve().parent
 W,H=1024,758
@@ -593,15 +594,22 @@ def demo_data():
        'observed_at':now,'forecast':[{'date':(now+dt.timedelta(days=i)).date(),'code':c,'high':hi,'low':lo,'rain':rain} for i,(c,hi,lo,rain) in enumerate([(2,18,9,30),(61,16,8,80),(1,17,7,15)],1)]},
             'football':{'last':{'opponent':'Fenerbahce (demo)','opponent_id':'436','opponent_logo':'https://a.espncdn.com/i/teamlogos/soccer/500/436.png','gs_logo':GS_LOGO_URL,'score':'2 - 1','league':'Demo-wedstrijd','date':now-dt.timedelta(days=2),'home':True},
                         'next':{'opponent':'Konyaspor (demo)','opponent_id':'7648','opponent_logo':'https://a.espncdn.com/i/teamlogos/soccer/500/7648.png','gs_logo':GS_LOGO_URL,'date':now+dt.timedelta(days=3),'league':'Demo-wedstrijd','home':True},
-                        'form':['W','L','G','W','W']},
+                        'form':['W','L','G','W','W'],
+                        'upcoming':[{'opponent':name,'date':now+dt.timedelta(days=delay),'home':i%2==0,
+                           'league':'Demo-competitie','source':'demo'}
+                           for i,(name,delay) in enumerate([('Club A (demo)',4),('Club B (demo)',7),
+                           ('Club C (demo)',10),('Club D (demo)',14),('Club E (demo)',17)])]},
             'stocks':{'NVDA':{'price':210.48,'change':1.2,'points':[2,3,4,4,6,6,5,7,8]},
                       'PLTR':{'price':153.60,'change':-0.4,'points':[4,5,6,5,5,4,7,6,5]},
                       'AAPL':{'price':284.13,'change':0.8,'points':[2,4,3,5,7,6,8,8,9]}},
             'gold':{'price':128300.0,'change':0.3},
             'weekend':{'matches':[],'sources_ok':0,'errors':[]},
             'standings':{'teams':[],'available':False},
-            'dbs':dbs_fixture_list(now),
-            'routes':{'breda':43,'utrecht':72,'maastricht':66},
+            'dbs':{'fixture':{'home':'DBS JO16-1','away':'VOORBEELD FC',
+                   'date':now+dt.timedelta(days=2),'opponent':'VOORBEELD FC',
+                   'home_game':True,'home_club_code':None,'away_club_code':None},
+                   'source':'DEMO','error':None},
+            'airspace':airspace.demo(now),
             'errors':[]}
 
 
@@ -618,9 +626,9 @@ def live_data(cfg):
             'stocks':{},
             'gold':{},
             'weekend':{'matches':[], 'sources_ok':0, 'errors':[]},
-            'standings':attempt('superlig_top3',superlig_top3,{'teams':[],'available':False}) if now.weekday()>=5 else {'teams':[],'available':False},
-            'dbs':dbs_fixture_list(now) if now.weekday()>=5 else {'fixture':None,'available':False,'source':None},
-            'routes':{name:attempt(name,lambda n=name:commute(cfg,n,now),None) for name in ('breda','utrecht','maastricht')},
+            'standings':{'teams':[],'available':False},
+            'dbs':attempt('dbs', lambda:dbs_fixture_list(now),{'fixture':None,'available':False,'source':None,'error':'Bron niet beschikbaar'}),
+            'airspace':airspace.fetch(now.astimezone(dt.timezone.utc)),
             'errors':errors}
 
 
@@ -773,7 +781,6 @@ def render(data,cfg):
             d.text((cx,cy),'?',font=f(26,'bold'),fill=INK,anchor='mm')
 
     now=data['now']; we=data.get('weather',{}); fb=data.get('football',{});
-    stocks=data.get('stocks',{}); gd=data.get('gold',{}); routes=data.get('routes',{})
     # Fixed five-star asset in this repository. Never fetch a club's own crest
     # on every GitHub Actions render: a transient outage used to cause the GS oval.
     gs_path=BASE/'assets'/'galatasaray_five_stars.png'
@@ -788,12 +795,23 @@ def render(data,cfg):
     # TOP / identity bar
     t(33,18,'DAYMARK',33,'heavy')
     t(34,61,'LIVE DAILY BRIEF',12,'bold',GRAY)
+    # Purely decorative Meerhoven skyline, no street address or home marker.
+    # Optional asset: if absent/invalid, do not interrupt the live dashboard.
+    skyline_path = BASE/'assets'/'meerhoven_skyline.png'
+    if skyline_path.is_file():
+        try:
+            with Image.open(skyline_path) as skyline_source:
+                skyline = skyline_source.convert('L')
+                skyline.load()
+            if skyline.size == (464, 80):
+                im.paste(skyline, (232, 7))
+            else:
+                print('DAYMARK: skyline asset heeft verkeerde afmetingen; overgeslagen')
+        except (OSError, ValueError) as exc:
+            print(f'DAYMARK: skyline kon niet worden geladen: {exc}')
     t(992,24,f'{DAYS[now.weekday()].upper()}  {now.day} {MONTHS[now.month-1].upper()} {now.year}',17,'bold',INK,anchor='ra')
     t(992,56,f'BIJGEWERKT  {now:%H:%M}  ·  EUROPE/AMSTERDAM',12,'bold',GRAY,anchor='ra')
     rule(33,94,991,94,INK,3)
-    if data['demo']:
-        d.rounded_rectangle((365,60,667,84),radius=5,fill=BLACK)
-        t(516,72,'DEMO / ALLE CIJFERS FICTIEF',12,'bold',WHITE,anchor='mm')
     # Three columns
     col_y1,col_y2=111,570
     xw=(33,345);xf=(356,674);xm=(685,991)
@@ -861,102 +879,71 @@ def render(data,cfg):
         draw_crest(im,d,377,395,73,90,gs_logo,'GALATASARAY')
         t(475,435,'Nog geen fixture',16,'bold')
         t(475,455,'Bron niet beschikbaar',12,'regular',GRAY)
-    # GALATASARAY / VOLGENDE 5 - dezelfde lijst op weekdagen en in het weekend.
-    # De middelste kolom toont de eerstvolgende wedstrijd; hier volgen 2 t/m 6.
-    label(704,133,'GALATASARAY  /  PROGRAMMA')
+    # Six right-column slots: GS fixture 2..6, plus the next confirmed DBS match,
+    # sorted chronologically. The central next GS fixture stays untouched.
+    label(704,133,'WEDSTRIJDEN  /  GS + DBS')
     upcoming_five=(fb.get('upcoming') or [])[:5]
-    if not upcoming_five:
-        t(704,197,'Geen extra wedstrijden',18,'bold')
-        t(704,227,'beschikbaar bij de bron',13,'regular',GRAY)
-    for i,fixture in enumerate(upcoming_five):
-        yy=171+i*75
-        if i:
-            rule(704,yy-11,973,yy-11)
-        at=fixture.get('date')
-        if isinstance(at,dt.datetime):
-            when=f"{DAYS[at.weekday()][:2].upper()} {at.day} {MONTHS[at.month-1].upper()}  {at:%H:%M}"
-        else:
-            when='DATUM NOG ONBEKEND'
-        t(704,yy,when,15,'bold',INK)
-        t(973,yy,'THUIS' if fixture.get('home') else 'UIT',12,'bold',GRAY,anchor='ra')
-        opponent=fixture.get('opponent') or 'Tegenstander onbekend'
-        t(704,yy+25,fit(opponent,18,268,'bold'),18,'bold',INK)
-        league=fixture.get('league') or ''
-        if str(fixture.get('source','')).startswith('verified_'):
-            league=league+'  ·  CACHE'
-        t(704,yy+50,fit(league,11,269),11,'regular',GRAY)
-    t(704,548,'CACHE = eerder bevestigde planning',10,'regular',GRAY)
-    # FOOTBALL LOWER BAR: form / standings / next DBS (weekends).
-    panel(33,587,991,703)
-    if now.weekday() in (5,6):
-        # Three separate headings share the same y-position; no weekend prefix.
-        label(52,598,'GS VORM')
-        label(373,598,'SÜPER LIG TOP 3')
-        label(685,598,'OMER UTKU DBS')
-        for sep in (356,668):rule(sep,628,sep,688)
-
-        # Oldest result on the left, newest completed result on the right.
-        # With fewer than five confirmed matches, empty slots stay on the LEFT.
-        form=(fb.get('form') or [])[:5]  # source is newest-first
-        form_slots=[None]*(5-len(form))+list(reversed(form))
-        for i,result in enumerate(form_slots):
-            cx,cy=74+i*55,659
-            radius=18
-            # Win: dark filled; loss: bright, double outline; draw: pale filled.
-            fill = INK if result=='W' else PALE if result=='G' else WHITE
-            d.ellipse((cx-radius,cy-radius,cx+radius,cy+radius),
-                      fill=fill,outline=INK,width=2)
-            if result=='L':
-                d.ellipse((cx-radius+3,cy-radius+3,cx+radius-3,cy+radius-3),
-                          outline=MID,width=1)
-            t(cx,cy,result if result else '·',17,'heavy',
-              WHITE if result=='W' else INK,anchor='mm')
-        t(52,683,'NIEUWSTE RECHTS  ·  W/L/G',10,'regular',GRAY)
-
-        teams=(data.get('standings') or {}).get('teams') or []
-        if teams:
-            for i,team in enumerate(teams[:3]):
-                yy=630+i*19
-                name=fit(team['name'],13,193,'bold')
-                t(374,yy,f"{i+1}. {name}",13,'bold' if 'galatasaray' in team['name'].casefold() else 'regular')
-                t(651,yy,str(team['points'])+' PT',13,'bold',INK,anchor='ra')
-        else:
-            t(374,645,'Stand niet beschikbaar',14,'bold',GRAY)
-
-        entry=(data.get('dbs') or {}).get('fixture')
-        if entry:
-            # Actual club crests when available; otherwise labelled monograms.
-            home,away=entry['home'],entry['away']
-            crest1=dbs_club_logo(home,entry.get('home_club_code'))
-            crest2=dbs_club_logo(away,entry.get('away_club_code'))
-            draw_crest(im,d,684,640,43,47,crest1,home)
-            draw_crest(im,d,947,640,36,47,crest2,away)
-            at=entry['date']
-            t(836,639, f"{DAYS[at.weekday()][:2].upper()} {at.day:02d} {MONTHS[at.month-1].upper()} · {at:%H:%M}",15,'heavy',INK,anchor='mt')
-            desc=fit(entry['opponent'].upper(),13,198,'bold')
-            t(836,662,desc,13,'bold',INK,anchor='mt')
-            t(836,681,'THUIS' if entry['home_game'] else 'UIT',11,'bold',GRAY,anchor='mt')
-        else:
-            t(685,645,'DBS O16-1',16,'bold')
-            t(685,670,'Geen bevestigde match',13,'regular',GRAY)
+    dbs_entry=(data.get('dbs') or {}).get('fixture')
+    fixtures=[('gs',fixt) for fixt in upcoming_five]
+    if isinstance(dbs_entry,dict) and isinstance(dbs_entry.get('date'),dt.datetime):
+        fixtures.append(('dbs',dbs_entry))
+    # If Sportlink is unavailable, keep a visible honest DBS placeholder.
     else:
-        # COMMUTE LOWER BAR: departure Meerhoven, Utrecht University as center column
-        panel(33,587,991,703)
-        label(52,598,'ROUTES  /  '+('NAAR MEERHOVEN' if route_period(now)=='terug' else 'VANAF MEERHOVEN')+'  ·  Google Maps')
-        for sep in (356,668):rule(sep,633,sep,688)
-        for i,(name,title) in enumerate([('breda','BREDA'),('utrecht','UTRECHT · UU'),('maastricht','MAASTRICHT')]):
-            left=(52,373,684)[i]
-            right=(337,649,974)[i]
-            t(left,638,title,18 if i!=1 else 17,'bold',GRAY)
-            minutes=routes.get(name)
-            t(right,630,f'{minutes} MIN' if minutes is not None else '— MIN',30,'heavy',INK,anchor='ra')
-            sub='AUTO + VERKEER' if minutes is not None else 'NOG NIET INGESTELD'
-            if name=='utrecht':sub='UU SCIENCE PARK' if minutes is not None else 'UU SCIENCE PARK'
-            t(left,676,sub,12,'bold',GRAY)
+        fixtures.append(('dbs_missing',{}))
+
+    def fixture_order(pair):
+        at=pair[1].get('date')
+        return at.astimezone(TZ) if isinstance(at,dt.datetime) and at.tzinfo else (
+               at.replace(tzinfo=TZ) if isinstance(at,dt.datetime) else dt.datetime.max.replace(tzinfo=TZ))
+    fixtures.sort(key=fixture_order)
+    # 6 x 62px fits below y570; no squeezed text or overflow.
+    for i,(kind,fixt) in enumerate(fixtures[:6]):
+        yy=166+i*62
+        if i: rule(704,yy-8,973,yy-8,fill=BORDER,width=1)
+        if kind=='gs':
+            at=fixt.get('date')
+            if isinstance(at,dt.datetime):
+                when=f"{DAYS[at.weekday()][:2].upper()} {at.day:02d} {MONTHS[at.month-1].upper()}  {at:%H:%M}"
+            else: when='TIJD ONBEKEND'
+            t(704,yy,when,13,'bold',INK)
+            t(972,yy,'THUIS' if fixt.get('home') else 'UIT',10,'bold',GRAY,anchor='ra')
+            t(704,yy+21,fit(fixt.get('opponent') or 'Tegenstander onbekend',17,265,'bold'),17,'bold',INK)
+            league=str(fixt.get('league') or '')
+            if str(fixt.get('source','')).startswith('verified_'): league+=' · CACHE'
+            t(704,yy+44,fit(league,10,265),10,'regular',GRAY)
+        elif kind=='dbs':
+            at=fixt['date']
+            when=f"DBS O16-1  ·  {DAYS[at.weekday()][:2].upper()} {at.day:02d} {MONTHS[at.month-1].upper()} {at:%H:%M}"
+            t(704,yy,fit(when,12,265,'bold'),12,'bold',INK)
+            home,away=fixt.get('home','DBS'),fixt.get('away','?')
+            crest1=dbs_club_logo(home,fixt.get('home_club_code'))
+            crest2=dbs_club_logo(away,fixt.get('away_club_code'))
+            if crest1 is not None:
+                draw_crest(im,d,705,yy+19,28,29,crest1,home)
+            else:
+                d.rounded_rectangle((707,yy+22,730,yy+44),radius=3,outline=INK,width=1)
+                t(718,yy+33,'?',12,'bold',anchor='mm')
+            if crest2 is not None:
+                draw_crest(im,d,942,yy+19,28,29,crest2,away)
+            else:
+                d.rounded_rectangle((944,yy+22,967,yy+44),radius=3,outline=INK,width=1)
+                t(955,yy+33,'?',12,'bold',anchor='mm')
+            t(740,yy+23,fit(fixt.get('opponent') or 'Tegenstander onbekend',13,193,'bold'),13,'bold',INK)
+            t(740,yy+43,'THUIS' if fixt.get('home_game') else 'UIT',10,'regular',GRAY)
+        else:
+            t(704,yy+5,'DBS O16-1',14,'bold',INK)
+            t(704,yy+28,'Geen bevestigde wedstrijd',12,'regular',GRAY)
+    t(704,548,'GS: 5 NA VOLGENDE  ·  DBS: SPORTLINK',10,'regular',GRAY)
+
+    # AIRSPACE HYBRID fills the full real lower band.
+    # This is one static image; the Kindle worker and power settings never change.
+    radar_stamp=airspace.render_bar(im,d,data.get('airspace') or {},font=f,
+                  color_ink=INK,color_gray=GRAY,color_border=BORDER,pale=PALE,
+                  white=WHITE,local_tz=TZ)
     # footer
     rule(33,718,991,718,INK,2)
-    t(34,730,'DAYMARK V3.8.7  •  PAPERWHITE 2  •  LANDSCAPE',12,'bold',GRAY)
-    foot='DEMO • NIET LIVE' if data['demo'] else 'DATA KAN VERTRAAGD ZIJN • ONTBREKEND = —'
+    t(34,730,'DAYMARK V3.9.1  •  PAPERWHITE 2  •  LANDSCAPE',12,'bold',GRAY)
+    foot='DEMO • NIET LIVE' if data['demo'] else radar_stamp+'  ·  NIET REALTIME'
     t(991,731,foot,12,'bold',GRAY,anchor='ra')
     return im
 
@@ -1010,21 +997,17 @@ def main():
         status={'generated_at':dt.datetime.now(dt.timezone.utc).isoformat(),
                 'mode':'demo' if args.demo else 'live',
                 'sources_missing':data.get('errors',[]),
-                'routes_configured':all(data['routes'].get(n) is not None for n in ('breda','utrecht','maastricht')),
-                'route_origin':'Meerhoven (Meerrijk) — openbaar wijkmiddelpunt' if route_period(data['now'])=='heen' else 'Breda / Utrecht UU / Maastricht',
-                'route_direction':route_period(data['now']),
-                'route_direction_label':'VANAF MEERHOVEN' if route_period(data['now'])=='heen' else 'NAAR MEERHOVEN',
-                'route_next_switch_nl':route_next_switch(data['now']).isoformat(),
-                'route_provider':'Google Maps Routes API',
-                'route_destination_type':'openbare locaties (Breda/Maastricht centrum; UU Science Park)',
-                'route_key_configured':bool(os.environ.get('GOOGLE_MAPS_API_KEY')), 
-                'route_destinations':['Breda centrum','Universiteit Utrecht - Heidelberglaan 8','Maastricht centrum'] if route_period(data['now'])=='heen' else ['Meerhoven (vanaf Breda)','Meerhoven (vanaf Universiteit Utrecht)','Meerhoven (vanaf Maastricht)'],
+                'airspace_status':(data.get('airspace') or {}).get('status'),
+                'airspace_source':(data.get('airspace') or {}).get('source'),
+                'airspace_count_30km':(data.get('airspace') or {}).get('count'),
+                'airspace_error':(data.get('airspace') or {}).get('error'),
+                'airspace_snapshot_utc':(data.get('airspace') or {}).get('observed_at_utc').isoformat() if isinstance((data.get('airspace') or {}).get('observed_at_utc'),dt.datetime) else None,
+                'airspace_enrichment_enabled':os.environ.get('DAYMARK_AIRSPACE_ENRICH')=='1',
                 'weather_temperature':data.get('weather',{}).get('temp'),
                 'weather_description':data.get('weather',{}).get('desc'),
                 'weather_is_day':data.get('weather',{}).get('is_day'),
                 'weather_observed_at_nl':(data.get('weather',{}).get('observed_at') or '').isoformat() if isinstance(data.get('weather',{}).get('observed_at'),dt.datetime) else None,
                 'weather_forecast_days':len(data.get('weather',{}).get('forecast') or []),
-                'route_minutes':data.get('routes',{}),
                 'football_last_available':bool(data.get('football',{}).get('last')),
                 'football_next_available':bool(data.get('football',{}).get('next')),
                 'football_events_checked':data.get('football',{}).get('events_checked',0),
