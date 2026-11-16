@@ -32,7 +32,7 @@ import weather_metno
 BASE = pathlib.Path(__file__).resolve().parent
 W,H=1024,758
 TZ=ZoneInfo('Europe/Amsterdam')
-WHITE=255; BLACK=17; INK=31; GRAY=95; MID=151; BORDER=207; PALE=246
+WHITE=255; BLACK=17; INK=31; GRAY=48; MID=151; BORDER=207; PALE=246
 DAYS=['maandag','dinsdag','woensdag','donderdag','vrijdag','zaterdag','zondag']
 MONTHS=['jan','feb','mrt','apr','mei','jun','jul','aug','sep','okt','nov','dec']
 DEFAULT_CONFIG={
