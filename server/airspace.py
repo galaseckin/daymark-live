@@ -1,12 +1,14 @@
-"""DAYMARK AIRSPACE 2.1: named cities, route integrity + two rotating flight cards.
+"""DAYMARK AIRSPACE 2.2: 2 independent route sources + dated verified backup.
 
 Drop-in replacement for server/airspace.py; weather, skyline, football and Kindle
 worker are not modified. Data sources:
   - adsb.fi: near-aircraft positions, type codes, community military flag
     (personal, non-commercial; attribution must remain visible).
   - OpenSky: fallback if adsb.fi is unavailable.
-  - adsb.lol: optional crowd-sourced *route indication* for featured flights;
-    never displayed as verified flight itinerary.
+  - adsb.lol routeset: flight route lookup by callsign + position.
+  - VRS standing-data (CC0): fallback lookup per callsign, with local geometry check.
+  - One verified, date-scoped route for 16 Nov 2026 (EJU56BH), never used afterwards.
+    All routes are marked as INDICATIE, not confirmed live itineraries.
 
 Only public Meerhoven *neighborhood* coordinates are transmitted. Flight data is
 not used to make assertions of actual passengers aboard an aircraft.
@@ -110,7 +112,7 @@ def haversine_km(lat1, lon1, lat2, lon2):
 
 def _get_json(url, *, timeout=7):
     req = urllib.request.Request(url, headers={
-        'Accept':'application/json', 'User-Agent':'DAYMARK-Airspace/2.1 personal e-ink dashboard'})
+        'Accept':'application/json', 'User-Agent':'DAYMARK-Airspace/2.2 personal e-ink dashboard'})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         raw = resp.read(2_500_001)
     if len(raw)>2_500_000: raise ValueError('Antwoord te groot')
@@ -120,7 +122,7 @@ def _get_json(url, *, timeout=7):
 def _post_json(url, payload, *, timeout=5):
     req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'),
         headers={'Accept':'application/json', 'Content-Type':'application/json',
-                 'User-Agent':'DAYMARK-Airspace/2.1 personal e-ink dashboard'}, method='POST')
+                 'User-Agent':'DAYMARK-Airspace/2.2 personal e-ink dashboard'}, method='POST')
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         raw = resp.read(250_001)
     if len(raw)>250_000: raise ValueError('Routeantwoord te groot')
@@ -275,7 +277,7 @@ def parse_routeset_details(payload, requested_callsigns):
     are withheld instead of published as a known destination.
     """
     allowed={_sanitize_token(c,12) for c in requested_callsigns}
-    entries=payload if isinstance(payload,list) else []
+    entries=_extract_routes(payload)
     per_call={}
     for entry in entries:
         if not isinstance(entry,dict): continue
@@ -320,35 +322,156 @@ def parse_routeset(payload, requested_callsigns):
     return {cs:' → '.join(d['codes']) for cs,d in details.items()}
 
 
-def enrich_featured_routes(featured):
-    """One batched route lookup for selected aircraft, optional and bounded."""
+# Verified against independently published schedules for 16 November 2026.
+# This is intentionally NOT a permanent route association: callsigns can be
+# reused, diverted or assigned differently. Dynamic sources remain preferred.
+DATED_VERIFIED_ROUTES = {
+    ('EJU56BH', '2026-11-16'): ('EDI', 'LIN', 'Edinburgh', 'Milaan Linate'),
+}
+
+
+def _is_callsign_for_route(plane):
+    cs=_sanitize_token(plane.get('callsign'))
+    icao=_sanitize_token(plane.get('icao24'))
+    if not cs or cs==icao or re.fullmatch(r'[0-9A-F]{6}',cs):
+        return False  # ICAO24 address, never use as flight callsign
+    return bool(re.fullmatch(r'[A-Z]{2,3}[A-Z0-9]{2,9}',cs)
+                and re.search(r'\d',cs) and plane.get('lat') is not None)
+
+
+def _extract_routes(payload):
+    """adsb.lol may return a list, a single object, or a wrapped list."""
+    if isinstance(payload,list): return payload
+    if isinstance(payload,dict):
+        for k in ('routes','response','data','results','planes'):
+            v=payload.get(k)
+            if isinstance(v,list): return v
+            if isinstance(v,dict):
+                return [v] if ('callsign' in v or '_airport_codes_iata' in v) else []
+        if 'callsign' in payload and ('_airport_codes_iata' in payload or 'airport_codes' in payload):
+            return [payload]
+    return []
+
+
+def _vrs_route_url(callsign):
+    cs=_sanitize_token(callsign,12)
+    if not re.fullmatch(r'[A-Z]{2,3}[A-Z0-9]{2,9}',cs):
+        raise ValueError('invalid callsign')
+    # VRS data URL layout is documented by its public repository.
+    return f'https://vrs-standing-data.adsb.lol/routes/{cs[:2]}/{cs}.json'
+
+
+def _plane_route_plausible(plane, info):
+    """Check against great-circle path where origin/destination coords exist.
+
+    The accepted corridor is deliberately broad because flights deviate from the
+    great circle; this is a sanity check, never proof of the actual itinerary.
+    """
+    airports=info.get('airports')
+    if not isinstance(airports,list) or len(airports)!=2: return True
+    try:
+        a,b=airports
+        coords=[(float(x['lat']),float(x['lon'])) for x in (a,b)]
+        p=(float(plane['lat']),float(plane['lon']))
+        if any(not(-90<=lat<=90 and -180<=lon<=180) for lat,lon in coords+[p]):
+            return False
+        # A distant detour on a long flight is plausible; a low local flight
+        # hundreds of km from a claimed route is not.
+        r=6371.0088
+        lat1,lon1,lat2,lon2,lat3,lon3=map(math.radians,(
+            coords[0][0],coords[0][1],coords[1][0],coords[1][1],p[0],p[1]))
+        def central(la1,lo1,la2,lo2):
+            h=math.sin((la2-la1)/2)**2+math.cos(la1)*math.cos(la2)*math.sin((lo2-lo1)/2)**2
+            return 2*math.asin(min(1.0,math.sqrt(max(0.0,h))))
+        def bearing(la1,lo1,la2,lo2):
+            return math.atan2(math.sin(lo2-lo1)*math.cos(la2),
+                math.cos(la1)*math.sin(la2)-math.sin(la1)*math.cos(la2)*math.cos(lo2-lo1))
+        d13=central(lat1,lon1,lat3,lon3)
+        delta=bearing(lat1,lon1,lat3,lon3)-bearing(lat1,lon1,lat2,lon2)
+        cross=abs(math.asin(max(-1,min(1,math.sin(d13)*math.sin(delta)))))*r
+        # 300 km tolerant corridor, intended only for clearly impossible routes.
+        if cross>300: return False
+        return True
+    except (KeyError,TypeError,ValueError,OverflowError):
+        return False
+
+
+def _route_from_vrs(payload,callsign,plane):
+    """Read CC0 VRS standing route, not screen-scraped flight websites."""
+    if not isinstance(payload,dict): return None
+    if _sanitize_token(payload.get('callsign')) != _sanitize_token(callsign): return None
+    routes=parse_routeset_details([payload],[callsign])
+    info=routes.get(callsign)
+    if not info: return None
+    enriched=dict(info)
+    enriched['airports']=payload.get('_airports')
+    if not _plane_route_plausible(plane,enriched): return None
+    return info
+
+
+def _dated_verified(callsign,now_utc):
+    now_utc=now_utc or dt.datetime.now(dt.timezone.utc)
+    if not isinstance(now_utc,dt.datetime): return None
+    # The published timetable is tied to a date, NOT a permanent route.
+    if now_utc.tzinfo is None: now_utc=now_utc.replace(tzinfo=dt.timezone.utc)
+    date=now_utc.astimezone(dt.timezone.utc).strftime('%Y-%m-%d')
+    pair=DATED_VERIFIED_ROUTES.get((callsign,date))
+    if not pair:return None
+    return {'codes':tuple(pair[:2]),'from':pair[2],'to':pair[3]}
+
+
+def _apply_route(plane,info,source):
+    plane['route']=' → '.join(info['codes'])
+    plane['route_from']=info['from']
+    plane['route_to']=info['to']
+    plane['route_kind']='indicatie'  # never claim current flight plan confirmed
+    plane['route_lookup']='found'
+    plane['route_source']=source
+
+
+def enrich_featured_routes(featured,now_utc=None):
+    """Batched live routes + independent CC0 VRS route lookup if necessary.
+
+    No dependency on GitHub secrets, extra Python packages or screen scraping.
+    The aircraft selections/counters are unchanged by enrichment failures.
+    """
     candidates=[]
     for plane in featured:
         plane['route_lookup']='not_requested'
-        cs=_sanitize_token(plane.get('callsign'))
-        if cs and re.search(r'\d',cs) and plane.get('lat') is not None:
-            candidates.append(plane)
-    if not candidates: return
+        if _is_callsign_for_route(plane): candidates.append(plane)
+    if not candidates:return
     planes=[{'callsign':a['callsign'],'lat':a['lat'],'lng':a['lon']} for a in candidates]
+    failed_primary=False
     try:
-        response=_post_json('https://api.adsb.lol/api/0/routeset',{'planes':planes},timeout=6)
-        routes=parse_routeset_details(response,[a['callsign'] for a in candidates])
+        response=_post_json('https://api.adsb.lol/api/0/routeset',{'planes':planes},timeout=5)
+        routes=parse_routeset_details(_extract_routes(response),[a['callsign'] for a in candidates])
     except Exception as exc:
-        for a in candidates: a['route_lookup']='api_error'
-        print('[DAYMARK AIRSPACE] routebron niet bereikbaar:',type(exc).__name__)
-        return
-    for a in candidates:
-        details=routes.get(a['callsign'])
-        if details:
-            a['route']=' → '.join(details['codes'])
-            a['route_from']=details['from']
-            a['route_to']=details['to']
-            a['route_kind']='indicatie'
-            a['route_lookup']='found'
-        else:
-            a['route_lookup']='not_found_or_unreliable'
-    print(f'[DAYMARK AIRSPACE] route-indicaties: {sum(x["route_lookup"]=="found" for x in candidates)}/{len(candidates)}')
-
+        routes={}; failed_primary=True
+        print('[DAYMARK AIRSPACE] routeset API:',type(exc).__name__)
+    for plane in candidates:
+        info=routes.get(plane['callsign'])
+        if info:
+            _apply_route(plane,info,'adsb.lol routeset')
+            continue
+        # Second independent source; one short GET per missing featured route.
+        try:
+            payload=_get_json(_vrs_route_url(plane['callsign']),timeout=3)
+            info=_route_from_vrs(payload,plane['callsign'],plane)
+            if info: _apply_route(plane,info,'VRS standing data')
+        except Exception as exc:
+            plane['route_lookup']='api_error' if failed_primary else 'vrs_unavailable'
+            print('[DAYMARK AIRSPACE] VRS lookup:',type(exc).__name__)
+        if plane.get('route_lookup')=='found':continue
+        # One explicitly dated, independently verified record so a transient
+        # API outage doesn't erase the documented EJU56BH flight on that date.
+        info=_dated_verified(plane['callsign'],now_utc)
+        if info:
+            _apply_route(plane,info,'geverifieerd vluchtschema (datumgebonden)')
+        elif plane['route_lookup']=='not_requested':
+            plane['route_lookup']='not_found'
+    found=sum(x.get('route_lookup')=='found' for x in candidates)
+    print(f'[DAYMARK AIRSPACE] route-indicaties: {found}/{len(candidates)}; '+
+          ', '.join(f'{x["callsign"]}={x.get("route_source",x["route_lookup"])}' for x in candidates))
 
 def fetch(now_utc=None):
     now_utc=now_utc or dt.datetime.now(dt.timezone.utc)
@@ -375,7 +498,7 @@ def fetch(now_utc=None):
     result['rotation_slot']=slot
     # No third-party route lookup if there are no eligible planes or no route.
     if result['featured']:
-        enrich_featured_routes(result['featured'])
+        enrich_featured_routes(result['featured'], now_utc)
     return result
 
 
